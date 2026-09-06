@@ -4,7 +4,8 @@
 > Canonical source of this code: repository `site_yacloud_openrouter`.
 
 `final class LLM` — static, one instance per request. Two providers behind one
-interface, per-request model/provider override, config-driven provider fallback,
+interface, per-request model/provider override, config-driven fallback (newer version of
+the same model, then the operator's list, then per-provider fallbacks),
 PDF OCR, optional call logging.
 
 ## 1. Lifecycle
@@ -54,13 +55,28 @@ LLM::jsonCompact($v): string                        // JSON_UNESCAPED_UNICODE|SL
   JSON → that side is retried through `callJson`, so the fallback chain and the JSON
   re-ask still apply. Statuses logged: `multi_fail`, `multi_no_content`, `ok`.
 
-## 4. Provider fallback chain — `dispatch()`
+## 4. Fallback chain — `dispatch()`
 
-Candidates = `[activeModel()]` + for each provider in `providerPriority()` its fallback
-model (`LLM_FALLBACK_MODEL` for openrouter, `YANDEX_FALLBACK_MODEL` for yandex).
+Candidates, in order:
+
+1. `activeModel()` — the chosen model.
+2. **Newer versions of that same model**, newest first — only when
+   `LLM_FALLBACK_MODE` is `auto` (the default). They come from
+   `LLM::autoFallbackRows()` → `ModelCatalog::newerSiblings()`
+   (`/spec/model_catalog.md` §5), so a refreshed live catalogue immediately supplies a
+   fresher backup (`claude-sonnet-4.5` → `claude-sonnet-4.6`). A model whose slug carries
+   no readable version (`yandexgpt`, `gpt-4o`) simply contributes nothing here.
+3. The operator's `LLM_FALLBACK_MODELS` — comma-separated **short ids** resolved through
+   `findModel()` (`LLM::configuredFallbackRows()`; unknown ids and `ocr_only` rows are
+   dropped). With `LLM_FALLBACK_MODE=manual` this is the only configured backup.
+4. For each provider in `providerPriority()`, its per-provider fallback model
+   (`LLM_FALLBACK_MODEL` for openrouter, `YANDEX_FALLBACK_MODEL` for yandex).
+
+Steps 2–3 keep each row's own provider — **a slug never travels to the other provider**.
 A provider is skipped when its credentials are absent (openrouter: `OPENROUTER_API_KEY`;
-yandex: `YANDEX_API_KEY` **and** `YANDEX_FOLDER_ID`); a fallback identical to the primary
-`full_id` is skipped.
+yandex: `YANDEX_API_KEY` **and** `YANDEX_FOLDER_ID`); a candidate identical to the primary
+`full_id` on the primary provider is skipped, and the final list is deduplicated by
+`provider|full_id` so no pair is attempted twice.
 
 Walk candidates in order; each attempt is logged with `provider:full_id` as the model tag:
 
