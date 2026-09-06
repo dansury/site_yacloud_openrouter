@@ -11,8 +11,13 @@ infrastructural — it implements no customer requirement (no TZ), so it carries
 no TZ citations. Specs live in [`spec.md`](spec.md) + `spec/`.
 
 - **OpenRouter + Yandex providers & models** (`llm.php`) — two providers behind one
-  interface, per-session model/provider override, config-driven provider fallback
-  chain, generic `chatText()` / `chatJson()`.
+  interface, per-session model/provider override, config-driven fallback chain
+  (a newer version of the same model first, then the operator's list, then the
+  per-provider fallbacks), generic `chatText()` / `chatJson()`.
+- **Live model catalogue** (`model_catalog.php`) — the model list is pulled from the
+  providers themselves (OpenRouter `GET /models`, Yandex `GET /v1/models`) and cached in
+  the `settings` table; `setup.php` refreshes it on load when the cache is stale. The
+  hardcoded list keeps working until (and after) the first refresh.
 - **Yandex OCR + PDF/DOCX parsing** (`parser.php`, `llm.php`) — DOCX via ZipArchive,
   PDF via `pdftotext` → OpenRouter vision models (file-parser strategies + native)
   → Yandex Vision OCR, in operator-chosen priority order.
@@ -29,6 +34,7 @@ No app coupling, no hardcoded secrets — everything is env- or `settings`-drive
 ```
 site_yacloud_openrouter/
 ├── config.php          # config: ENV + settings-table overlay, AVAILABLE_MODELS
+├── model_catalog.php   # ModelCatalog — live provider catalogue, cache, model versions
 ├── llm.php             # LLM class — OpenRouter + Yandex, fallback, PDF OCR
 ├── parser.php          # Parser class — DOCX/PDF extraction + normalization
 ├── mailer.php          # Mailer class — SMTP send (custom/attachment/test/error)
@@ -37,7 +43,7 @@ site_yacloud_openrouter/
 ├── example.php         # CLI usage examples
 ├── .env.example
 ├── spec.md             # spec navigation index
-├── spec/               # per-module specs (llm, parser, mailer, settings)
+├── spec/               # per-module specs (llm, model_catalog, parser, mailer, settings)
 └── data/               # SQLite DB + logs (gitignored)
 ```
 
@@ -69,8 +75,10 @@ $text = LLM::chatText('Ты — ассистент.', 'Привет!');
 $json = LLM::chatJson('Верни JSON {"ok":true}.', 'go');   // strict-JSON mode
 ```
 
-If the primary provider/model fails, `dispatch()` walks `LLM_PROVIDER_PRIORITY`
-and retries each provider's fallback model. When OpenRouter fails and Yandex
+If the primary model fails, `dispatch()` first tries a **newer version of the same
+model** from the catalogue (`LLM_FALLBACK_MODE=auto`, the default — e.g. `gpt-4.1` →
+`gpt-5.1`), then the operator's `LLM_FALLBACK_MODELS`, then walks
+`LLM_PROVIDER_PRIORITY` retrying each provider's fallback model. When OpenRouter fails and Yandex
 serves the call, a one-shot `Mailer::sendErrorNotification` fires (if Mailer + a
 configured `ERROR_EMAIL` are present).
 
@@ -132,3 +140,17 @@ php example.php email you@example.com
 catalogue, plus a few OpenRouter ids) and the `yandex-vision-ocr` OCR-only entry.
 Yandex `full_id` is the slug used in `gpt://<folder>/<full_id>/latest`. Add/remove
 rows there; the `LLM_DEFAULT_MODEL` dropdown in `setup.php` is built from this list.
+
+That list is the **starting point**, not the whole catalogue: `ModelCatalog` pulls the
+providers' own lists over HTTP and caches them in `settings`. Opening `setup.php`
+refreshes the cache when it is older than `MODEL_CATALOG_TTL_MIN` minutes (15 by
+default); the two buttons there force a refresh or drop the cache. A live model with a
+known slug just flags the hardcoded row as available; an unknown one is appended in its
+own `… (каталог)` group with the USD price the provider reported. Network trouble never
+breaks the page — the previous list stays and the reason is shown.
+
+The version parser behind the same class powers the default backup: when the chosen model
+fails, `LLM_FALLBACK_MODE=auto` reaches for a **newer version of the same model**
+(`claude-sonnet-4` → `claude-sonnet-4.5`), so a refreshed catalogue keeps the backup
+current on its own. Models whose slug carries no readable version (`yandexgpt`, `gpt-4o`)
+fall through to `LLM_FALLBACK_MODELS`, which is also what `manual` mode uses exclusively.
