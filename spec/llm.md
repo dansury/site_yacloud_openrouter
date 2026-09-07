@@ -32,7 +32,9 @@ Absent/failing logger never breaks a call (§7).
 
 Model row shape: `['id','label','provider','full_id','price_in','price_out', 'ocr_only'?]`.
 `full_id` semantics: OpenRouter — the model slug sent as-is; Yandex — the slug inside
-`gpt://<YANDEX_FOLDER_ID>/<full_id>/latest`.
+`gpt://<YANDEX_FOLDER_ID>/<full_id>/latest`, except the "common instance" models
+`gpt-oss-120b` and `gpt-oss-20b`, which Yandex rejects with a `/latest` segment —
+those are addressed as `gpt://<YANDEX_FOLDER_ID>/<full_id>` (see `LLM::yandexModelUri()`).
 
 ## 3. Entry points
 
