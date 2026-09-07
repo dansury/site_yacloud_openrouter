@@ -41,6 +41,7 @@ those are addressed as `gpt://<YANDEX_FOLDER_ID>/<full_id>` (see `LLM::yandexMod
 ```php
 LLM::chatText(string $system, string $user, ?int $sessionId = null, float $temp = 0.7): string
 LLM::chatJson(string $system, string $user, ?int $sessionId = null, float $temp = 0.1): array
+LLM::visionJson(string $system, string $userText, array $imageDataUrls, ?int $sessionId = null, float $temp = 0.1): array
 LLM::dispatchPair(array $specA, array $specB, ?int $sessionId): array   // [parsedA, parsedB]
 LLM::ocrPdf(string $pdfPath): ?string
 LLM::render(string $tpl, array $vars): string       // {{token}} substitution
@@ -51,6 +52,16 @@ LLM::jsonCompact($v): string                        // JSON_UNESCAPED_UNICODE|SL
 - `chatJson` → `callJson` → `dispatch(json:true)` + `parseJson`. On unparseable JSON:
   one stricter re-ask (`step` suffixed `_retry`, `temp=0.0`, extra user turn demanding a
   single JSON object, no markdown). Still unparseable → `RuntimeException`.
+- `visionJson` → `callVisionJson` — same shape as `callJson` (dispatch + parseJson +
+  one stricter re-ask), but the user turn is multimodal:
+  `visionContent()` builds `[{type:text,...}?, {type:image_url,image_url:{url}}, ...]`
+  from `$userText` + `$imageDataUrls` (each a `data:image/...;base64,...` URI, or a
+  plain https URL). No image bytes are read from disk here — the caller (e.g. a food-photo
+  endpoint) hands over already-encoded `data:` URIs. Goes through the same `dispatch()`
+  fallback chain as `chatJson`: pick a vision-capable model (`setModelOverride` or a
+  vision-capable `LLM_DEFAULT_MODEL`, e.g. `gemini-2.0-flash`) — a candidate that can't
+  read images simply fails its slot (`no_content`/`exception`) and the chain moves on,
+  same as any other `dispatch()` failure (§4).
 - `dispatchPair` — two calls in parallel via `curl_multi` on the **primary** model only
   (spec: `['step','system','user','temp','json']`). Provider not configured → both fall
   back to sequential `callJson`. Per-side transport failure / empty content / unparseable
