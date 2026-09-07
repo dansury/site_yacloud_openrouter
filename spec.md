@@ -31,6 +31,9 @@
   duck-typed `logLLMCall(...)`.
 - **Model catalogue is data, not code.** Chat/OCR models live in
   `config.php → AVAILABLE_MODELS`; `setup.php` builds its dropdown from that list.
+  The list is also **pulled live from the providers** and cached in `settings`
+  (`model_catalog.php`); the hardcoded rows are what the service runs on until the
+  first refresh, and are never replaced by it.
 - **Spec-driven changes.** For any new feature or non-trivial change: update the
   relevant `/spec/<module>.md` first, then implement to match it. Specs describe
   actual functionality only — never changelogs or version history.
@@ -43,6 +46,7 @@
 | File | Modules covered |
 |---|---|
 | `/spec/llm.md`      | `llm.php` — OpenRouter + Yandex providers, overrides, fallback chain, PDF OCR |
+| `/spec/model_catalog.md` | `model_catalog.php` — live provider catalogue, cache in `settings`, model versions |
 | `/spec/parser.md`   | `parser.php` — DOCX/PDF extraction, normalization, quality heuristic |
 | `/spec/mailer.md`   | `mailer.php` — SMTP transport, MIME building, attachments, error notifications |
 | `/spec/settings.md` | `config.php`, `settings_store.php`, `setup.php` — config resolution, `settings` table, admin page |
@@ -54,6 +58,7 @@
 | File | Spec file |
 |---|---|
 | `llm.php`            | `/spec/llm.md` |
+| `model_catalog.php`  | `/spec/model_catalog.md` |
 | `parser.php`         | `/spec/parser.md` |
 | `mailer.php`         | `/spec/mailer.md` |
 | `config.php`         | `/spec/settings.md` |
@@ -74,7 +79,7 @@ absent → PDF goes straight to OCR.
 
 | Path | Content |
 |---|---|
-| `DB_PATH` (default `data/app.db`) | SQLite; table `settings` (see `/spec/settings.md` §2) |
+| `DB_PATH` (default `data/app.db`) | SQLite; table `settings` (see `/spec/settings.md` §2) — also holds the cached model catalogue (`/spec/model_catalog.md` §2) |
 | `LOG_DIR` (default `data/logs`)   | `error_email_throttle.json` (see `/spec/mailer.md` §5) |
 
 Both are gitignored (`data/*.db`, `data/logs/`).

@@ -26,7 +26,9 @@ and never breaks config loading.
 ### Whitelist (operator-editable)
 
 `LLM_PROVIDER`, `LLM_DEFAULT_MODEL`, `LLM_PROVIDER_PRIORITY`, `OPENROUTER_API_KEY`,
-`LLM_VISION_MODEL`, `LLM_FALLBACK_MODEL`, `LLM_OCR_MODELS`, `YANDEX_FALLBACK_MODEL`,
+`LLM_VISION_MODEL`, `LLM_FALLBACK_MODEL`, `LLM_FALLBACK_MODE`, `LLM_FALLBACK_MODELS`,
+`MODEL_CATALOG_MODELS`, `MODEL_CATALOG_SYNCED_AT`, `MODEL_CATALOG_ERROR`,
+`MODEL_CATALOG_TTL_MIN`, `LLM_OCR_MODELS`, `YANDEX_FALLBACK_MODEL`,
 `YANDEX_API_KEY`, `YANDEX_FOLDER_ID`, `YANDEX_LLM_URL`, `YANDEX_OCR_URL`,
 `YANDEX_OCR_MODEL`, `YANDEX_OCR_ENABLED`, `ADMIN_EMAIL`, `ERROR_EMAIL`, `SMTP_HOST`,
 `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM`, `SMTP_FROM_NAME`, `ADMIN_PASSWORD`.
@@ -39,6 +41,8 @@ Keys outside the whitelist are ENV/code-only (e.g. `OPENROUTER_URL`, `LLM_TIMEOU
 | Group | Keys (default) |
 |---|---|
 | Provider switch | `LLM_PROVIDER` (`openrouter`), `LLM_DEFAULT_MODEL` (`gemini-2.0-flash`), `LLM_PROVIDER_PRIORITY` (`openrouter,yandex`) |
+| Fallback | `LLM_FALLBACK_MODE` (`auto` — a newer version of the same model first; `manual` — list only), `LLM_FALLBACK_MODELS` (`` — comma-separated short ids) |
+| Model catalogue | `MODEL_CATALOG_MODELS` (``), `MODEL_CATALOG_SYNCED_AT` (``), `MODEL_CATALOG_ERROR` (``), `MODEL_CATALOG_TTL_MIN` (15) — see `/spec/model_catalog.md` |
 | OpenRouter | `OPENROUTER_API_KEY` (``), `OPENROUTER_URL` (chat/completions), `LLM_VISION_MODEL`, `LLM_FALLBACK_MODEL` (`openrouter/auto`), `LLM_OCR_MODELS` (array, comma-split from ENV) |
 | Yandex Cloud | `YANDEX_API_KEY`, `YANDEX_FOLDER_ID`, `YANDEX_LLM_URL` (OpenAI-compatible), `YANDEX_OCR_URL` (`…/ocr/v1/recognizeText`), `YANDEX_OCR_MODEL` (`page`), `YANDEX_OCR_ENABLED` (`1`), `YANDEX_FALLBACK_MODEL` (`deepseek-r1`) |
 | Timeouts | `LLM_TIMEOUT_SEC` (120), `LLM_MAX_RETRIES` (2) |
@@ -50,12 +54,20 @@ No secret ever has a non-empty default in code.
 
 ### `AVAILABLE_MODELS`
 
-Row: `['id','label','provider','full_id','price_in','price_out']` (+ `'ocr_only' => true`
+Row: `['id','label','provider','full_id','group','price_in','price_out']` (+ `'ocr_only' => true`
 for OCR-only entries). `price_in`/`price_out` are approximate RUB per 1k tokens, shown
 for operator orientation only — nothing in the code charges by them. `provider` is
 `yandex` or `openrouter`; `full_id` is the provider-native id (Yandex: the slug used in
-`gpt://<folder>/<full_id>/latest`). The `LLM_DEFAULT_MODEL` dropdown in `setup.php` is
-built from this list with `ocr_only` rows filtered out. Adding a model = adding a row.
+`gpt://<folder>/<full_id>/latest`); `group` names the `<optgroup>` the row lands in. The
+`LLM_DEFAULT_MODEL` dropdown in `setup.php` is built from this list with `ocr_only` rows
+filtered out. Adding a model = adding a row.
+
+**Live rows.** At the end of `config.php` the cached provider catalogue is merged in
+(`ModelCatalog::decode()` + `merge()`, no network — see `/spec/model_catalog.md`). A live
+row for a known slug only flags the hardcoded row `live => true`; an unknown model is
+appended with an `or-` / `ya-` short id, a `… (каталог)` group and USD prices in
+`price_usd_in` / `price_usd_out` (`price_in`/`price_out` stay 0 — no exchange rate is
+invented). Nothing about the hardcoded rows is rewritten, so saved settings keep working.
 
 ## 2. `settings_store.php` — `SettingsStore`
 
@@ -94,6 +106,14 @@ existing value (that is what lets the masked key/password placeholders work).
 `YANDEX_OCR_ENABLED` is a checkbox and is therefore always written (`'1'` / `'0'`).
 The confirmation message lists the keys that were edited.
 
+**Model catalogue** (`POST model_catalog=refresh|forget`): API-key fields typed into the
+form are saved first (so the fetch uses the new credentials), then `config.php` is
+re-read and `ModelCatalog::refresh()` / `forget()` runs, reporting per-provider counts or
+failure reasons. Independently of the buttons, **every page load** calls
+`ModelCatalog::maybeRefresh()` before rendering: a cache older than `MODEL_CATALOG_TTL_MIN`
+minutes is refetched, a fresh one is left alone, and a network failure only shows up as a
+status line — the page and the previous list are unaffected (`/spec/model_catalog.md` §3).
+
 **SMTP test** (`POST smtp_test`): re-reads `config.php` (so just-saved values apply),
 picks `smtp_test_to` or `ADMIN_EMAIL`, calls `Mailer::sendTest` and renders ✅ with
 host:port or ⚠️ with the exception message.
@@ -103,8 +123,11 @@ host:port or ⚠️ with the exception message.
 Secrets are never echoed back: `$mask()` renders bullets for passwords, `$mask_key()`
 renders `abcd…wxyz` for API keys. All output goes through `htmlspecialchars`.
 
-**Form sections:** Провайдер и модели (provider, priority, default model, vision model,
-per-provider fallback models, OpenRouter OCR chain, Yandex OCR model + enable checkbox) ·
+**Form sections:** Провайдер и модели (provider, priority, default model — grouped by
+`group` with a price hint, live-catalogue status + refresh/forget buttons and its TTL,
+fallback mode with the newer versions it currently resolves to plus `LLM_FALLBACK_MODELS`,
+vision model, per-provider fallback models, OpenRouter OCR chain, Yandex OCR model +
+enable checkbox) ·
 API-ключи (OpenRouter key, Yandex key + folder) · Почта (host, port, user, password,
 from, from name, `ADMIN_EMAIL`, `ERROR_EMAIL`) · Доступ (`ADMIN_PASSWORD`) · Тест SMTP.
 

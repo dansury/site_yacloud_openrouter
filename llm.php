@@ -8,8 +8,11 @@
  *  - Two providers behind one interface: OpenRouter (Bearer) and Yandex
  *    (Api-Key + folder, gpt:// model URIs, OpenAI-compatible endpoint).
  *  - Per-session model / provider overrides (LLM::setModelOverride / setProviderOverride).
- *  - Config-driven provider fallback chain (LLM_PROVIDER_PRIORITY) with
- *    automatic retry on the next provider's fallback model.
+ *  - Config-driven fallback chain: the chosen model first, then — with
+ *    LLM_FALLBACK_MODE=auto (the default) — a NEWER VERSION of the same model
+ *    from the catalogue (ModelCatalog::newerSiblings), then the operator's
+ *    LLM_FALLBACK_MODELS, and finally each provider's per-provider fallback
+ *    model walked in LLM_PROVIDER_PRIORITY order.
  *  - PDF OCR via OpenRouter vision models (file-parser plugin strategies +
  *    native) and Yandex Vision OCR, in operator-chosen priority order.
  *  - Generic chat entry points: chatText() and chatJson().
@@ -18,6 +21,8 @@
  *   $cfg   — array from config.php
  *   $store — optional object with logLLMCall(...) (no-op if absent)
  */
+
+require_once __DIR__ . '/model_catalog.php';   // model versions for the auto fallback
 
 final class LLM {
     private static ?array $cfg = null;
@@ -67,6 +72,33 @@ final class LLM {
             if (!in_array($p, $list, true)) $list[] = $p;
         }
         return $list;
+    }
+
+    /** Fallback mode: 'auto' — newer version of the same model first, 'manual' — list only. */
+    private static function fallbackMode(): string {
+        $m = strtolower(trim((string) (self::cfg()['LLM_FALLBACK_MODE'] ?? 'auto')));
+        return $m === 'manual' ? 'manual' : 'auto';
+    }
+
+    /** Newer versions of the chosen model — the default backup. $shortId omitted
+     *  → LLM_DEFAULT_MODEL (setup.php shows the operator what 'auto' resolves to). */
+    public static function autoFallbackRows(?string $shortId = null): array {
+        $cfg = self::cfg();
+        $row = self::findModel($shortId ?? (string) ($cfg['LLM_DEFAULT_MODEL'] ?? ''));
+        if ($row === null) return [];
+        return ModelCatalog::newerSiblings($row, (array) ($cfg['AVAILABLE_MODELS'] ?? []));
+    }
+
+    /** Operator-picked backup rows from LLM_FALLBACK_MODELS (short ids). */
+    public static function configuredFallbackRows(): array {
+        $out = [];
+        foreach (explode(',', (string) (self::cfg()['LLM_FALLBACK_MODELS'] ?? '')) as $id) {
+            $id = trim($id);
+            if ($id === '') continue;
+            $row = self::findModel($id);
+            if ($row !== null && empty($row['ocr_only'])) $out[] = $row;
+        }
+        return $out;
     }
 
     /** Look up model row by short id. Returns null if unknown. */
@@ -340,6 +372,17 @@ final class LLM {
         ];
     }
 
+    /**
+     * "Common instance" models (gpt-oss-120b, gpt-oss-20b) are rejected by
+     * Yandex when addressed with a /latest version segment — unlike
+     * yandexgpt/deepseek/llama/etc., they take gpt://<folder>/<full_id> as-is.
+     */
+    private static function yandexModelUri(string $folder, string $fullId): string {
+        static $noVersionSuffix = ['gpt-oss-120b', 'gpt-oss-20b'];
+        $uri = 'gpt://' . $folder . '/' . $fullId;
+        return in_array($fullId, $noVersionSuffix, true) ? $uri : $uri . '/latest';
+    }
+
     /** Build a configured cURL handle for the active provider/model (no curl_exec). */
     private static function buildCurl(array $modelRow, array $messages, float $temp, bool $jsonMode, array $extra) {
         $cfg = self::cfg();
@@ -350,7 +393,7 @@ final class LLM {
             if ($folder === '' || empty($cfg['YANDEX_API_KEY'])) {
                 throw new RuntimeException('Yandex LLM not configured (YANDEX_API_KEY / YANDEX_FOLDER_ID empty)');
             }
-            $modelStr = 'gpt://' . $folder . '/' . $modelRow['full_id'] . '/latest';
+            $modelStr = self::yandexModelUri($folder, (string) $modelRow['full_id']);
             $headers = [
                 'Authorization: Api-Key ' . $cfg['YANDEX_API_KEY'],
                 'x-folder-id: ' . $folder,
@@ -415,11 +458,23 @@ final class LLM {
         $cfg = self::cfg();
         $primary = self::activeModel();
         $primaryProvider = $primary['provider'] ?? 'openrouter';
-        // Config-driven fallback: walk providers in LLM_PROVIDER_PRIORITY order
-        // (primary first), appending each provider's fallback model.
+        // Fallback order: the chosen model, then (in auto mode) newer versions
+        // of the same model, then the operator's LLM_FALLBACK_MODELS, and only
+        // then each provider's per-provider fallback model.
         $candidates = [$primary];
         $hasOR = !empty($cfg['OPENROUTER_API_KEY']);
         $hasYA = !empty($cfg['YANDEX_API_KEY']) && !empty($cfg['YANDEX_FOLDER_ID']);
+        $named = self::fallbackMode() === 'auto'
+            ? array_merge(self::autoFallbackRows($primary['id'] ?? null), self::configuredFallbackRows())
+            : self::configuredFallbackRows();
+        foreach ($named as $row) {
+            $prov = $row['provider'] ?? 'openrouter';
+            if ($prov === 'openrouter' && !$hasOR) continue;
+            if ($prov === 'yandex' && !$hasYA) continue;
+            // A slug never travels to the other provider: the row keeps its own.
+            if (($row['full_id'] ?? '') === ($primary['full_id'] ?? '') && $prov === $primaryProvider) continue;
+            $candidates[] = $row;
+        }
         $fallbackModels = [
             'openrouter' => (string) ($cfg['LLM_FALLBACK_MODEL'] ?? 'openrouter/auto'),
             'yandex'     => (string) ($cfg['YANDEX_FALLBACK_MODEL'] ?? 'deepseek-r1'),
@@ -432,6 +487,14 @@ final class LLM {
             if ($prov === $primaryProvider && $fbModel === (string) ($primary['full_id'] ?? '')) continue;
             $candidates[] = ['provider' => $prov, 'full_id' => $fbModel, 'id' => 'fallback_' . $prov, 'label' => 'fallback_' . $prov];
         }
+        // One attempt per provider+slug pair, in the order built above.
+        $seen = [];
+        $candidates = array_values(array_filter($candidates, static function (array $row) use (&$seen) {
+            $key = ($row['provider'] ?? '?') . '|' . ($row['full_id'] ?? '?');
+            if (isset($seen[$key])) return false;
+            $seen[$key] = true;
+            return true;
+        }));
         $lastError = null;
         foreach ($candidates as $idx => $row) {
             $t0 = microtime(true);
@@ -475,7 +538,7 @@ final class LLM {
             if ($folder === '' || empty($cfg['YANDEX_API_KEY'])) {
                 throw new RuntimeException('Yandex LLM not configured (YANDEX_API_KEY / YANDEX_FOLDER_ID empty)');
             }
-            $modelStr = 'gpt://' . $folder . '/' . $modelRow['full_id'] . '/latest';
+            $modelStr = self::yandexModelUri($folder, (string) $modelRow['full_id']);
             $headers = [
                 'Authorization: Api-Key ' . $cfg['YANDEX_API_KEY'],
                 'x-folder-id: ' . $folder,
