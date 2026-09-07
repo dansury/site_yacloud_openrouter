@@ -148,6 +148,15 @@ final class LLM {
         return self::callJson('chat', $system, $user, $sessionId, $temp);
     }
 
+    /** Multimodal strict-JSON completion: system + text + one or more images
+     *  (data: URIs, e.g. "data:image/jpeg;base64,...."). Same fallback chain and
+     *  JSON re-ask as chatJson() — pick a vision-capable model (setModelOverride /
+     *  LLM_DEFAULT_MODEL) before calling, image-blind models will just fail their
+     *  candidate slot and the chain moves on. */
+    public static function visionJson(string $system, string $userText, array $imageDataUrls, ?int $sessionId = null, float $temp = 0.1): array {
+        return self::callVisionJson('vision', $system, $userText, $imageDataUrls, $sessionId, $temp);
+    }
+
     /* ──────────── PDF OCR ──────────── */
 
     public static function ocrPdf(string $pdfPath): ?string {
@@ -421,6 +430,35 @@ final class LLM {
         $messages = [
             ['role' => 'system', 'content' => $system],
             ['role' => 'user', 'content' => $user],
+        ];
+        $raw = self::dispatch($step, $messages, $sessionId, $temp, true);
+        $parsed = self::parseJson($raw);
+        if ($parsed !== null) return $parsed;
+
+        $retryMessages = $messages;
+        $retryMessages[] = ['role' => 'user', 'content' => 'Ответ не распознан как строгий JSON. Верни ровно один JSON-объект по указанной схеме. Без markdown, без комментариев.'];
+        $raw2 = self::dispatch($step . '_retry', $retryMessages, $sessionId, 0.0, true);
+        $parsed = self::parseJson($raw2);
+        if ($parsed !== null) return $parsed;
+
+        throw new RuntimeException("LLM step $step: invalid JSON after retry");
+    }
+
+    /** [{type:text}, {type:image_url,image_url:{url}}, ...] — image_url first-class
+     *  since GPT-4o/Gemini/Claude-on-OpenRouter all accept it; data: URIs inline. */
+    private static function visionContent(string $userText, array $imageDataUrls): array {
+        $parts = [];
+        if ($userText !== '') $parts[] = ['type' => 'text', 'text' => $userText];
+        foreach ($imageDataUrls as $url) {
+            $parts[] = ['type' => 'image_url', 'image_url' => ['url' => (string) $url]];
+        }
+        return $parts;
+    }
+
+    private static function callVisionJson(string $step, string $system, string $userText, array $imageDataUrls, ?int $sessionId, float $temp): array {
+        $messages = [
+            ['role' => 'system', 'content' => $system],
+            ['role' => 'user', 'content' => self::visionContent($userText, $imageDataUrls)],
         ];
         $raw = self::dispatch($step, $messages, $sessionId, $temp, true);
         $parsed = self::parseJson($raw);
