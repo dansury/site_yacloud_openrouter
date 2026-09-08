@@ -382,14 +382,15 @@ final class LLM {
     }
 
     /**
-     * "Common instance" models (gpt-oss-120b, gpt-oss-20b) are rejected by
-     * Yandex when addressed with a /latest version segment — unlike
-     * yandexgpt/deepseek/llama/etc., they take gpt://<folder>/<full_id> as-is.
+     * gpt://<folder>/<full_id>/<version> — the address every Yandex model takes,
+     * gpt-oss included: the version segment is how the provider resolves the
+     * model. `full_id` is stored without it, so «latest» is added here unless the
+     * operator typed his own version («yandexgpt/rc», «yandexgpt/deprecated»).
      */
     private static function yandexModelUri(string $folder, string $fullId): string {
-        static $noVersionSuffix = ['gpt-oss-120b', 'gpt-oss-20b'];
-        $uri = 'gpt://' . $folder . '/' . $fullId;
-        return in_array($fullId, $noVersionSuffix, true) ? $uri : $uri . '/latest';
+        $fullId = trim($fullId, " /");
+        if (!preg_match('~/(latest|rc|deprecated)$~', $fullId)) $fullId .= '/latest';
+        return 'gpt://' . $folder . '/' . $fullId;
     }
 
     /** Build a configured cURL handle for the active provider/model (no curl_exec). */
