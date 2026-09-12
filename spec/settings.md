@@ -41,9 +41,10 @@ Keys outside the whitelist are ENV/code-only (e.g. `OPENROUTER_URL`, `LLM_TIMEOU
 | Group | Keys (default) |
 |---|---|
 | Provider switch | `LLM_PROVIDER` (`openrouter`), `LLM_DEFAULT_MODEL` (`gemini-2.0-flash`), `LLM_PROVIDER_PRIORITY` (`openrouter,yandex`) |
-| Fallback | `LLM_FALLBACK_MODE` (`auto` — a newer version of the same model first; `manual` — list only), `LLM_FALLBACK_MODELS` (`` — comma-separated short ids) |
+| Fallback | `LLM_FALLBACK_MODE` (`auto` — a newer version of the same model first; `manual` — list only), `LLM_FALLBACK_MODELS` (`` — comma-separated short ids, written by three dropdowns in `setup.php`) |
 | Model catalogue | `MODEL_CATALOG_MODELS` (``), `MODEL_CATALOG_SYNCED_AT` (``), `MODEL_CATALOG_ERROR` (``), `MODEL_CATALOG_TTL_MIN` (15) — see `/spec/model_catalog.md` |
-| OpenRouter | `OPENROUTER_API_KEY` (``), `OPENROUTER_URL` (chat/completions), `LLM_VISION_MODEL`, `LLM_FALLBACK_MODEL` (`openrouter/auto`), `LLM_OCR_MODELS` (array, comma-split from ENV) |
+| OpenRouter | `OPENROUTER_API_KEY` (``), `OPENROUTER_URL` (chat/completions), `LLM_FALLBACK_MODEL` (`openrouter/auto`), `LLM_OCR_MODELS` (array, comma-split from ENV) |
+| Vision | `LLM_VISION_MODEL` (`google/gemini-2.0-flash-001`) — the model for photos, labels and PDF pages. Accepts `"<provider>:<slug>"`, a short id, or a bare slug (bare = OpenRouter), so a Yandex multimodal model can be chosen here too (`/spec/llm.md` §2) |
 | Yandex Cloud | `YANDEX_API_KEY`, `YANDEX_FOLDER_ID`, `YANDEX_LLM_URL` (OpenAI-compatible), `YANDEX_OCR_URL` (`…/ocr/v1/recognizeText`), `YANDEX_OCR_MODEL` (`page`), `YANDEX_OCR_ENABLED` (`1`), `YANDEX_FALLBACK_MODEL` (`deepseek-r1`) |
 | Timeouts | `LLM_TIMEOUT_SEC` (120), `LLM_MAX_RETRIES` (2) |
 | Admin gate | `ADMIN_PASSWORD` (``) |
@@ -54,13 +55,21 @@ No secret ever has a non-empty default in code.
 
 ### `AVAILABLE_MODELS`
 
-Row: `['id','label','provider','full_id','group','price_in','price_out']` (+ `'ocr_only' => true`
-for OCR-only entries). `price_in`/`price_out` are approximate RUB per 1k tokens, shown
+Row: `['id','label','provider','full_id','group','price_in','price_out','vision']`
+(+ `'ocr_only' => true` for OCR-only entries). `vision` — `true` the model accepts images,
+`false` it does not; on a live row it is absent when the provider reported no modality,
+and `LLM` treats the absence as «maybe» (`/spec/llm.md` §2). `price_in`/`price_out` are approximate RUB per 1k tokens, shown
 for operator orientation only — nothing in the code charges by them. `provider` is
 `yandex` or `openrouter`; `full_id` is the provider-native id (Yandex: the slug used in
 `gpt://<folder>/<full_id>/latest`); `group` names the `<optgroup>` the row lands in. The
-`LLM_DEFAULT_MODEL` dropdown in `setup.php` is built from this list with `ocr_only` rows
-filtered out. Adding a model = adding a row.
+model dropdowns in `setup.php` are built from this list with `ocr_only` rows filtered out.
+Adding a model = adding a row.
+
+The hardcoded Yandex rows are the slugs Yandex AI Studio actually serves (first-party
+`yandexgpt*`, open catalogue `llama-3.3-70b-instruct`, `phi-4`, and the multimodal
+`gemma-3-{4b,12b,27b}-it`, `qwen2.5-vl-72b-instruct`, `deepseek-vl2{,-tiny}`); an invented
+slug answers `Failed to get model` at call time, so rows are added only for models the
+provider's own catalogue lists.
 
 **Live rows.** At the end of `config.php` the cached provider catalogue is merged in
 (`ModelCatalog::decode()` + `merge()`, no network — see `/spec/model_catalog.md`). A live
@@ -104,6 +113,10 @@ the login form and `exit`.
 and written through `setSetting` **only when non-empty** — blanks never overwrite an
 existing value (that is what lets the masked key/password placeholders work).
 `YANDEX_OCR_ENABLED` is a checkbox and is therefore always written (`'1'` / `'0'`).
+The model dropdowns are written whenever submitted, empty pick included, since
+«— не задана —» has to be able to clear a value: `LLM_VISION_MODEL`, `LLM_FALLBACK_MODEL`,
+`YANDEX_FALLBACK_MODEL`, and `LLM_FALLBACK_MODELS` joined from the three ordered
+`LLM_FALLBACK_MODEL_{1,2,3}` selects (deduplicated, blanks dropped).
 The confirmation message lists the keys that were edited.
 
 **Model catalogue** (`POST model_catalog=refresh|forget`): API-key fields typed into the
@@ -113,6 +126,20 @@ failure reasons. Independently of the buttons, **every page load** calls
 `ModelCatalog::maybeRefresh()` before rendering: a cache older than `MODEL_CATALOG_TTL_MIN`
 minutes is refetched, a fresh one is left alone, and a network failure only shows up as a
 status line — the page and the previous list are unaffected (`/spec/model_catalog.md` §3).
+
+**Provider self-test** (`POST llm_probe`): `LLM::probe()` (`/spec/llm.md` §3) — one ✅/⛔
+line per leg (default model, vision model, each per-provider fallback) with the provider's
+own answer, so a wrong key, a foreign folder or a model missing from the cloud catalogue
+is named on the spot. Every leg also lands in the log.
+
+**Log** (`/spec/diag_log.md`): `DiagLog::init()` runs next to the `SettingsStore`, with a
+code stamp over the module files — a redeploy therefore starts the log empty while the
+`settings` rows survive. `LLM::init($cfg, DiagLog::store())` routes every model call into
+it. The page renders two read-only textareas built by `DiagLog::asText()` — «только
+ошибки» and «полный лог», both prefixed with the environment header (PHP, DB path, code
+stamp, masked keys, `LLM::configSummary()`) — with a copy-to-clipboard button each and
+`POST diag_clear` to empty it. API keys and passwords are registered via
+`DiagLog::addSecret()` right after `init()`, so the copied text carries none.
 
 **SMTP test** (`POST smtp_test`): re-reads `config.php` (so just-saved values apply),
 picks `smtp_test_to` or `ADMIN_EMAIL`, calls `Mailer::sendTest` and renders ✅ with
@@ -125,11 +152,16 @@ renders `abcd…wxyz` for API keys. All output goes through `htmlspecialchars`.
 
 **Form sections:** Провайдер и модели (provider, priority, default model — grouped by
 `group` with a price hint, live-catalogue status + refresh/forget buttons and its TTL,
-fallback mode with the newer versions it currently resolves to plus `LLM_FALLBACK_MODELS`,
-vision model, per-provider fallback models, OpenRouter OCR chain, Yandex OCR model +
-enable checkbox) ·
+fallback mode with the newer versions it currently resolves to, three backup-model
+dropdowns, vision model (multimodal rows of both providers), per-provider fallback model
+dropdowns, OpenRouter OCR chain, Yandex OCR model + enable checkbox) ·
 API-ключи (OpenRouter key, Yandex key + folder) · Почта (host, port, user, password,
-from, from name, `ADMIN_EMAIL`, `ERROR_EMAIL`) · Доступ (`ADMIN_PASSWORD`) · Тест SMTP.
+from, from name, `ADMIN_EMAIL`, `ERROR_EMAIL`) · Доступ (`ADMIN_PASSWORD`) ·
+Проверка провайдеров · Лог · Тест SMTP.
+
+No model field is free text: every one of them is a `<select>` over the catalogue
+(`$model_select()`), and a saved value the catalogue no longer lists stays as its own
+`… — нет в каталоге` option so the browser cannot silently swap the model on save.
 
 Deployment note: the page must not be reachable without TLS, and `ADMIN_PASSWORD` must
 be set before the file is exposed to the web.

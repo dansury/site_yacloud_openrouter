@@ -29,10 +29,24 @@ final class LLM {
     private static $store = null;                      // optional logger
     private static ?string $modelOverride = null;      // short id from AVAILABLE_MODELS
     private static ?string $providerOverride = null;   // 'openrouter' | 'yandex' | null
+    /** Per-candidate outcome of the last dispatch() — what the admin log shows. */
+    private static array $trace = [];
 
     public static function init(array $cfg, $store = null): void {
         self::$cfg = $cfg;
         self::$store = $store;
+    }
+
+    /** Every candidate of the last dispatch(): provider, slug, http code, error. */
+    public static function lastTrace(): array { return self::$trace; }
+
+    /** The same trace as one line per attempt — the text a failure carries. */
+    public static function traceText(): string {
+        $out = [];
+        foreach (self::$trace as $i => $t) {
+            $out[] = sprintf('#%d %s → %s', $i + 1, $t['candidate'], $t['result']);
+        }
+        return implode(' | ', $out);
     }
 
     public static function cfg(): array {
@@ -107,6 +121,85 @@ final class LLM {
             if (($row['id'] ?? '') === $shortId) return $row;
         }
         return null;
+    }
+
+    /**
+     * Resolve one operator-written model reference to a catalogue row. Accepted
+     * spellings, in order of precedence:
+     *   "yandex:gemma-3-27b-it"           provider-qualified slug
+     *   "or-google-gemini-2-0-flash-001"  short id (AVAILABLE_MODELS.id)
+     *   "google/gemini-2.0-flash-001"     bare slug (AVAILABLE_MODELS.full_id)
+     * A provider-qualified slug missing from the catalogue still resolves — the
+     * operator may be ahead of the cached list — but keeps its stated provider,
+     * so a Yandex slug is never sent to OpenRouter or the other way round.
+     */
+    public static function resolveModelSpec(string $spec): ?array {
+        $spec = trim($spec);
+        if ($spec === '') return null;
+        $provider = null;
+        if (preg_match('~^(openrouter|yandex):(.+)$~i', $spec, $m)) {
+            $provider = strtolower($m[1]);
+            $spec = trim($m[2]);
+        }
+        $models = (array) (self::cfg()['AVAILABLE_MODELS'] ?? []);
+        foreach ($models as $row) {                                   // exact slug
+            if ((string) ($row['full_id'] ?? '') !== $spec) continue;
+            if ($provider !== null && ($row['provider'] ?? '') !== $provider) continue;
+            return $row;
+        }
+        if ($provider === null) {
+            $row = self::findModel($spec);                            // short id
+            if ($row !== null) return $row;
+        }
+        if ($provider === null) return null;
+        return [
+            'id' => $provider . ':' . $spec, 'label' => $spec,
+            'provider' => $provider, 'full_id' => $spec,
+            'price_in' => 0.0, 'price_out' => 0.0,
+        ];
+    }
+
+    /** Does this row accept images? Unknown (no flag) counts as "maybe". */
+    public static function rowIsVision(array $row): bool {
+        return !isset($row['vision']) || !empty($row['vision']);
+    }
+
+    /** LLM_VISION_MODEL as a catalogue row — the model used for photos, labels
+     *  and PDF pages. NULL when unset or unresolvable. */
+    public static function visionModelRow(): ?array {
+        $row = self::resolveModelSpec((string) (self::cfg()['LLM_VISION_MODEL'] ?? ''));
+        return ($row !== null && empty($row['ocr_only'])) ? $row : null;
+    }
+
+    /** Every vision-capable row of the catalogue — the vision fallback pool and
+     *  what the admin dropdown is built from. */
+    public static function visionModelRows(): array {
+        $out = [];
+        foreach ((array) (self::cfg()['AVAILABLE_MODELS'] ?? []) as $row) {
+            if (!empty($row['ocr_only'])) continue;
+            if (empty($row['vision'])) continue;     // only models KNOWN to see
+            $out[] = $row;
+        }
+        return $out;
+    }
+
+    /** Is this provider+slug present in the catalogue? Used to drop a blind
+     *  per-provider fallback (YANDEX_FALLBACK_MODEL) that the cloud folder does
+     *  not actually serve — that is what answers «Failed to get model». */
+    private static function slugInCatalogue(string $provider, string $slug): bool {
+        foreach ((array) (self::cfg()['AVAILABLE_MODELS'] ?? []) as $row) {
+            if (($row['provider'] ?? '') === $provider && (string) ($row['full_id'] ?? '') === $slug) return true;
+        }
+        return false;
+    }
+
+    /** Does the catalogue know ANY live (provider-confirmed) row for a provider?
+     *  Only then is «not in the catalogue» evidence that a slug is wrong. */
+    private static function hasLiveRows(string $provider): bool {
+        foreach ((array) (self::cfg()['AVAILABLE_MODELS'] ?? []) as $row) {
+            if (($row['provider'] ?? '') === $provider && !empty($row['live'])) return true;
+        }
+        return false;
     }
 
     /** Resolve the active model for the current request, honoring provider override. */
@@ -190,16 +283,31 @@ final class LLM {
             if ($text !== null) return $text;
         }
 
+        // OCR chain entries accept the same spellings as LLM_VISION_MODEL
+        // ("openrouter:google/gemini-2.5-flash", a short id, or a bare slug);
+        // empty list → LLM_VISION_MODEL.
         $models = $cfg['LLM_OCR_MODELS'] ?? [];
         if (empty($models)) $models = [$cfg['LLM_VISION_MODEL']];
+        $ocrRows = [];
+        foreach ($models as $spec) {
+            $row = self::resolveModelSpec((string) $spec);
+            if ($row === null) $row = ['provider' => 'openrouter', 'full_id' => (string) $spec];
+            if (($row['provider'] ?? '') !== 'openrouter') {
+                // Yandex chat models take images, not PDF files: the Yandex leg
+                // of PDF recognition is Yandex Vision OCR above/below.
+                $errors[] = $row['provider'] . ':' . $row['full_id'] . ': PDF идёт через Yandex Vision OCR, не через чат-модель';
+                continue;
+            }
+            $ocrRows[] = $row;
+        }
         $strategies = [
             ['label' => 'pdf-text',    'extra' => ['plugins' => [['id' => 'file-parser', 'pdf' => ['engine' => 'pdf-text']]]]],
             ['label' => 'mistral-ocr', 'extra' => ['plugins' => [['id' => 'file-parser', 'pdf' => ['engine' => 'mistral-ocr']]]]],
             ['label' => 'native',      'extra' => []],
         ];
         if (!empty($cfg['OPENROUTER_API_KEY'])) {
-            foreach ($models as $model) {
-                $row = ['provider' => 'openrouter', 'full_id' => $model];
+            foreach ($ocrRows as $row) {
+                $model = (string) $row['full_id'];
                 foreach ($strategies as $s) {
                     $tag = $model . '/' . $s['label'];
                     try {
@@ -225,6 +333,10 @@ final class LLM {
             if ($text !== null) return $text;
         }
 
+        self::diag('error', 'PDF OCR: ни один движок не дал текста', [
+            'attempts' => $errors,
+            'config'   => self::configSummary(),
+        ]);
         throw new RuntimeException('PDF OCR failed: ' . implode(' | ', $errors));
     }
 
@@ -472,13 +584,13 @@ final class LLM {
             ['role' => 'system', 'content' => $system],
             ['role' => 'user', 'content' => self::visionContent($userText, $imageDataUrls)],
         ];
-        $raw = self::dispatch($step, $messages, $sessionId, $temp, true);
+        $raw = self::dispatch($step, $messages, $sessionId, $temp, true, true);
         $parsed = self::parseJson($raw);
         if ($parsed !== null) return $parsed;
 
         $retryMessages = $messages;
         $retryMessages[] = ['role' => 'user', 'content' => 'Ответ не распознан как строгий JSON. Верни ровно один JSON-объект по указанной схеме. Без markdown, без комментариев.'];
-        $raw2 = self::dispatch($step . '_retry', $retryMessages, $sessionId, 0.0, true);
+        $raw2 = self::dispatch($step . '_retry', $retryMessages, $sessionId, 0.0, true, true);
         $parsed = self::parseJson($raw2);
         if ($parsed !== null) return $parsed;
 
@@ -493,9 +605,21 @@ final class LLM {
         return trim(self::dispatch($step, $messages, $sessionId, $temp, false));
     }
 
-    private static function dispatch(string $step, array $messages, ?int $sessionId, float $temp, bool $json): string {
+    /**
+     * Run one logical step across the candidate chain until a model answers.
+     *
+     * $vision — the request carries images: the chain starts at LLM_VISION_MODEL
+     * (when set) and skips every row the catalogue marks as image-blind, instead
+     * of burning attempts on text-only models.
+     *
+     * Every attempt is recorded in self::$trace and the failure carries the WHOLE
+     * chain, not just the last error: with "openrouter → yandex" the last line
+     * used to be the only thing an operator saw, so a missing OpenRouter key read
+     * as a Yandex problem.
+     */
+    private static function dispatch(string $step, array $messages, ?int $sessionId, float $temp, bool $json, bool $vision = false): string {
         $cfg = self::cfg();
-        $primary = self::activeModel();
+        $primary = $vision ? (self::visionModelRow() ?? self::activeModel()) : self::activeModel();
         $primaryProvider = $primary['provider'] ?? 'openrouter';
         // Fallback order: the chosen model, then (in auto mode) newer versions
         // of the same model, then the operator's LLM_FALLBACK_MODELS, and only
@@ -506,10 +630,12 @@ final class LLM {
         $named = self::fallbackMode() === 'auto'
             ? array_merge(self::autoFallbackRows($primary['id'] ?? null), self::configuredFallbackRows())
             : self::configuredFallbackRows();
+        if ($vision) $named = array_merge($named, self::visionModelRows());
         foreach ($named as $row) {
             $prov = $row['provider'] ?? 'openrouter';
             if ($prov === 'openrouter' && !$hasOR) continue;
             if ($prov === 'yandex' && !$hasYA) continue;
+            if ($vision && !self::rowIsVision($row)) continue;
             // A slug never travels to the other provider: the row keeps its own.
             if (($row['full_id'] ?? '') === ($primary['full_id'] ?? '') && $prov === $primaryProvider) continue;
             $candidates[] = $row;
@@ -524,7 +650,19 @@ final class LLM {
             $fbModel = $fallbackModels[$prov] ?? '';
             if ($fbModel === '') continue;
             if ($prov === $primaryProvider && $fbModel === (string) ($primary['full_id'] ?? '')) continue;
-            $candidates[] = ['provider' => $prov, 'full_id' => $fbModel, 'id' => 'fallback_' . $prov, 'label' => 'fallback_' . $prov];
+            // A blind per-provider fallback that the live catalogue does not
+            // list is skipped: sending it only yields «Failed to get model»
+            // and hides the real reason the chain got this far.
+            if (self::hasLiveRows($prov) && !self::slugInCatalogue($prov, $fbModel)) {
+                self::$trace[] = [
+                    'candidate' => $prov . ':' . $fbModel,
+                    'result'    => 'пропущен: модели нет в каталоге провайдера',
+                ];
+                continue;
+            }
+            $row = ['provider' => $prov, 'full_id' => $fbModel, 'id' => 'fallback_' . $prov, 'label' => 'fallback_' . $prov];
+            if ($vision && !self::rowIsVision($row)) continue;
+            $candidates[] = $row;
         }
         // One attempt per provider+slug pair, in the order built above.
         $seen = [];
@@ -534,7 +672,9 @@ final class LLM {
             $seen[$key] = true;
             return true;
         }));
+        self::$trace = [];
         $lastError = null;
+        $failures = [];
         foreach ($candidates as $idx => $row) {
             $t0 = microtime(true);
             $tag = $row['provider'] . ':' . $row['full_id'];
@@ -543,15 +683,20 @@ final class LLM {
                 $latency = (int) ((microtime(true) - $t0) * 1000);
                 if ($resp === null) {
                     $lastError = 'empty response';
+                    $failures[] = $tag . ' → ' . $lastError;
+                    self::$trace[] = ['candidate' => $tag, 'result' => $lastError, 'latency_ms' => $latency];
                     self::logCall($sessionId, $step, $tag, $latency, 'empty', $lastError, null);
                     continue;
                 }
                 $content = self::extractContent($resp);
                 if (!is_string($content) || trim($content) === '') {
-                    $lastError = 'no content field';
+                    $lastError = 'no content field: ' . mb_substr((string) json_encode($resp, JSON_UNESCAPED_UNICODE), 0, 300);
+                    $failures[] = $tag . ' → ' . $lastError;
+                    self::$trace[] = ['candidate' => $tag, 'result' => $lastError, 'latency_ms' => $latency];
                     self::logCall($sessionId, $step, $tag, $latency, 'no_content', $lastError, json_encode($resp));
                     continue;
                 }
+                self::$trace[] = ['candidate' => $tag, 'result' => 'ok (' . mb_strlen($content) . ' симв.)', 'latency_ms' => $latency];
                 self::logCall($sessionId, $step, $tag, $latency, 'ok', null, $content);
                 if ($idx > 0 && $primaryProvider === 'openrouter' && ($row['provider'] ?? '') === 'yandex') {
                     self::notifyOpenRouterFallback($step, $sessionId, $tag, (string) $lastError);
@@ -560,10 +705,110 @@ final class LLM {
             } catch (Throwable $e) {
                 $latency = (int) ((microtime(true) - $t0) * 1000);
                 $lastError = $e->getMessage();
+                $failures[] = $tag . ' → ' . $lastError;
+                self::$trace[] = ['candidate' => $tag, 'result' => $lastError, 'latency_ms' => $latency];
                 self::logCall($sessionId, $step, $tag, $latency, 'exception', $lastError, null);
             }
         }
-        throw new RuntimeException("LLM $step failed: $lastError");
+        // The whole chain, numbered — the message an operator can act on.
+        $chain = [];
+        foreach ($failures as $n => $line) $chain[] = '[' . ($n + 1) . '] ' . $line;
+        $detail = $chain ? implode('; ', $chain) : 'ни одного кандидата: проверьте ключи провайдеров';
+        $msg = "LLM $step failed (" . count($failures) . ' попыток): ' . $detail;
+        self::diag('error', 'Все кандидаты отказали на шаге «' . $step . '»', [
+            'step'       => $step,
+            'vision'     => $vision,
+            'primary'    => ($primary['provider'] ?? '?') . ':' . ($primary['full_id'] ?? '?'),
+            'candidates' => count($candidates),
+            'attempts'   => self::$trace,
+            'config'     => self::configSummary(),
+        ]);
+        throw new RuntimeException($msg);
+    }
+
+    /** Non-secret snapshot of what the LLM layer is configured with — attached
+     *  to every failure so a copied log explains itself without the admin page. */
+    public static function configSummary(): array {
+        $cfg = self::cfg();
+        $vision = self::visionModelRow();
+        return [
+            'provider'        => self::effectiveProvider(),
+            'priority'        => implode(',', self::providerPriority()),
+            'default_model'   => (string) ($cfg['LLM_DEFAULT_MODEL'] ?? ''),
+            'vision_model'    => (string) ($cfg['LLM_VISION_MODEL'] ?? ''),
+            'vision_resolved' => $vision !== null ? ($vision['provider'] . ':' . $vision['full_id']) : '(не разобрана)',
+            'fallback_mode'   => self::fallbackMode(),
+            'fallback_models' => (string) ($cfg['LLM_FALLBACK_MODELS'] ?? ''),
+            'openrouter_key'  => !empty($cfg['OPENROUTER_API_KEY']) ? 'задан' : 'НЕ ЗАДАН',
+            'yandex_key'      => !empty($cfg['YANDEX_API_KEY']) ? 'задан' : 'НЕ ЗАДАН',
+            'yandex_folder'   => !empty($cfg['YANDEX_FOLDER_ID']) ? (string) $cfg['YANDEX_FOLDER_ID'] : 'НЕ ЗАДАН',
+            'catalogue_rows'  => count((array) ($cfg['AVAILABLE_MODELS'] ?? [])),
+            'catalogue_at'    => (string) ($cfg['MODEL_CATALOG_SYNCED_AT'] ?? ''),
+            'catalogue_error' => (string) ($cfg['MODEL_CATALOG_ERROR'] ?? ''),
+        ];
+    }
+
+    /**
+     * Provider self-test for the admin page: one minimal chat completion per
+     * configured provider, with the exact request and answer recorded. Never
+     * throws — every leg reports ok/false plus a human-readable reason, so an
+     * operator sees «key wrong» / «model not in this folder» instead of a
+     * recognition failure hours later.
+     */
+    public static function probe(): array {
+        $cfg = self::cfg();
+        $out = [];
+        $messages = [
+            ['role' => 'system', 'content' => 'Отвечай одним словом.'],
+            ['role' => 'user', 'content' => 'Скажи: готово'],
+        ];
+        $legs = [];
+        $default = self::activeModel();
+        $legs['модель по умолчанию'] = $default;
+        $vision = self::visionModelRow();
+        if ($vision !== null) $legs['vision-модель'] = $vision;
+        foreach (['openrouter' => 'LLM_FALLBACK_MODEL', 'yandex' => 'YANDEX_FALLBACK_MODEL'] as $prov => $key) {
+            $slug = (string) ($cfg[$key] ?? '');
+            if ($slug === '') continue;
+            $legs['запасная ' . $prov] = ['provider' => $prov, 'full_id' => $slug, 'id' => 'fallback_' . $prov];
+        }
+        foreach ($legs as $label => $row) {
+            $prov = (string) ($row['provider'] ?? 'openrouter');
+            $tag = $prov . ':' . ($row['full_id'] ?? '?');
+            if ($prov === 'openrouter' && empty($cfg['OPENROUTER_API_KEY'])) {
+                $out[] = ['leg' => $label, 'model' => $tag, 'ok' => false, 'text' => 'OPENROUTER_API_KEY не задан'];
+                continue;
+            }
+            if ($prov === 'yandex' && (empty($cfg['YANDEX_API_KEY']) || empty($cfg['YANDEX_FOLDER_ID']))) {
+                $out[] = ['leg' => $label, 'model' => $tag, 'ok' => false, 'text' => 'YANDEX_API_KEY / YANDEX_FOLDER_ID не заданы'];
+                continue;
+            }
+            $t0 = microtime(true);
+            try {
+                $resp = self::http($row, $messages, 0.0, false);
+                $content = is_array($resp) ? self::extractContent($resp) : null;
+                $ms = (int) ((microtime(true) - $t0) * 1000);
+                $ok = is_string($content) && trim($content) !== '';
+                $out[] = [
+                    'leg' => $label, 'model' => $tag, 'ok' => $ok,
+                    'text' => $ok ? ('ответ получен за ' . $ms . ' мс') : 'ответ без содержимого: '
+                        . mb_substr((string) json_encode($resp, JSON_UNESCAPED_UNICODE), 0, 300),
+                ];
+            } catch (Throwable $e) {
+                $out[] = ['leg' => $label, 'model' => $tag, 'ok' => false, 'text' => $e->getMessage()];
+            }
+        }
+        foreach ($out as $r) {
+            self::diag($r['ok'] ? 'info' : 'error', 'Проверка провайдера — ' . $r['leg'] . ' (' . $r['model'] . '): ' . $r['text'],
+                ['config' => self::configSummary()]);
+        }
+        return $out;
+    }
+
+    /** Diagnostic log entry — a no-op when the host app did not vendor DiagLog. */
+    private static function diag(string $level, string $message, array $context = []): void {
+        if (!class_exists('DiagLog')) return;
+        try { DiagLog::write($level, 'llm', $message, $context); } catch (Throwable $e) { /* never break */ }
     }
 
     /** $modelRow keys: provider, full_id. $extra is merged into the request body. */
@@ -615,7 +860,20 @@ final class LLM {
         $err = curl_error($ch);
         curl_close($ch);
         if ($out === false || $code >= 400) {
-            throw new RuntimeException(strtoupper($provider) . " HTTP $code: " . ($err ?: substr((string) $out, 0, 300)));
+            // Everything needed to reproduce the call by hand: endpoint, the
+            // model string as the provider saw it (a Yandex gpt:// URI hides
+            // no secret — the folder id is not one), and the answer body.
+            // «YANDEX HTTP 400: Failed to get model» on its own says nothing
+            // about WHICH model was asked for.
+            throw new RuntimeException(sprintf(
+                '%s HTTP %s @ %s model=%s%s: %s',
+                strtoupper((string) $provider),
+                (string) $code,
+                (string) $url,
+                (string) $modelStr,
+                $jsonMode ? ' json_object' : '',
+                $err ?: substr((string) $out, 0, 400)
+            ));
         }
         $data = json_decode((string) $out, true);
         return is_array($data) ? $data : null;
