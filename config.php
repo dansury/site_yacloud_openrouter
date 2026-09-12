@@ -110,23 +110,33 @@ $config = [
     'PROMPT_VERSION'        => 'v1.0',
 
     /* ── Available models (chat + OCR). price_in/price_out: RUB per 1k tokens (approx).
-       Yandex `full_id` is the slug used in gpt://<folder>/<full_id>/latest. ── */
+       Yandex `full_id` is the slug used in gpt://<folder>/<full_id>/latest.
+       `vision` — the model accepts images (photos, labels, page scans). Absent
+       on live catalogue rows the provider gave no modality for; LLM treats the
+       absence as "maybe" and only ever SKIPS rows explicitly marked false. ── */
     'AVAILABLE_MODELS'      => [
         // `group` names the <optgroup> the row lands in (setup.php dropdown).
         // ── Yandex AI Studio — first-party ──
-        ['id' => 'deepseek-r1',    'label' => 'DeepSeek R1',     'provider' => 'yandex',     'full_id' => 'deepseek-r1',    'group' => 'Yandex AI Studio', 'price_in' => 1.20, 'price_out' => 1.20],
-        ['id' => 'deepseek-v3',    'label' => 'DeepSeek V3',     'provider' => 'yandex',     'full_id' => 'deepseek-v3',    'group' => 'Yandex AI Studio', 'price_in' => 0.50, 'price_out' => 0.50],
-        ['id' => 'yandexgpt',      'label' => 'YandexGPT Pro',   'provider' => 'yandex',     'full_id' => 'yandexgpt',      'group' => 'Yandex AI Studio', 'price_in' => 1.20, 'price_out' => 1.20],
-        ['id' => 'yandexgpt-lite', 'label' => 'YandexGPT Lite',  'provider' => 'yandex',     'full_id' => 'yandexgpt-lite', 'group' => 'Yandex AI Studio', 'price_in' => 0.20, 'price_out' => 0.20],
-        ['id' => 'llama-3.3-70b-instruct', 'label' => 'Llama 3.3 70B Instruct', 'provider' => 'yandex', 'full_id' => 'llama-3.3-70b-instruct', 'group' => 'Yandex AI Studio', 'price_in' => 0.50, 'price_out' => 0.50],
-        ['id' => 'qwen3-235b-a22b','label' => 'Qwen3 235B A22B',  'provider' => 'yandex',     'full_id' => 'qwen3-235b-a22b-fp8', 'group' => 'Yandex AI Studio', 'price_in' => 0.80, 'price_out' => 0.80],
-        ['id' => 'gemma-3-27b-it', 'label' => 'Gemma 3 27B IT',   'provider' => 'yandex',     'full_id' => 'gemma-3-27b-it', 'group' => 'Yandex AI Studio', 'price_in' => 0.45, 'price_out' => 0.45],
+        ['id' => 'deepseek-r1',    'label' => 'DeepSeek R1',     'provider' => 'yandex', 'full_id' => 'deepseek-r1',    'group' => 'Yandex AI Studio', 'price_in' => 1.20, 'price_out' => 1.20, 'vision' => false],
+        ['id' => 'deepseek-v3',    'label' => 'DeepSeek V3',     'provider' => 'yandex', 'full_id' => 'deepseek-v3',    'group' => 'Yandex AI Studio', 'price_in' => 0.50, 'price_out' => 0.50, 'vision' => false],
+        ['id' => 'yandexgpt',      'label' => 'YandexGPT Pro',   'provider' => 'yandex', 'full_id' => 'yandexgpt',      'group' => 'Yandex AI Studio', 'price_in' => 1.20, 'price_out' => 1.20, 'vision' => false],
+        ['id' => 'yandexgpt-lite', 'label' => 'YandexGPT Lite',  'provider' => 'yandex', 'full_id' => 'yandexgpt-lite', 'group' => 'Yandex AI Studio', 'price_in' => 0.20, 'price_out' => 0.20, 'vision' => false],
+        // ── Yandex AI Studio — open catalogue (slug = gpt://folder/<full_id>/latest) ──
+        ['id' => 'llama-3.3-70b-instruct', 'label' => 'Llama 3.3 70B Instruct', 'provider' => 'yandex', 'full_id' => 'llama-3.3-70b-instruct', 'group' => 'Yandex AI Studio', 'price_in' => 0.50, 'price_out' => 0.50, 'vision' => false],
+        ['id' => 'phi-4',                  'label' => 'Phi-4',                  'provider' => 'yandex', 'full_id' => 'phi-4',                  'group' => 'Yandex AI Studio', 'price_in' => 0.25, 'price_out' => 0.25, 'vision' => false],
+        // Multimodal Yandex rows — what a photo / label / scan can be sent to.
+        ['id' => 'gemma-3-4b-it',   'label' => 'Gemma 3 4B IT (зрение)',   'provider' => 'yandex', 'full_id' => 'gemma-3-4b-it',   'group' => 'Yandex AI Studio · зрение', 'price_in' => 0.15, 'price_out' => 0.15, 'vision' => true],
+        ['id' => 'gemma-3-12b-it',  'label' => 'Gemma 3 12B IT (зрение)',  'provider' => 'yandex', 'full_id' => 'gemma-3-12b-it',  'group' => 'Yandex AI Studio · зрение', 'price_in' => 0.30, 'price_out' => 0.30, 'vision' => true],
+        ['id' => 'gemma-3-27b-it',  'label' => 'Gemma 3 27B IT (зрение)',  'provider' => 'yandex', 'full_id' => 'gemma-3-27b-it',  'group' => 'Yandex AI Studio · зрение', 'price_in' => 0.45, 'price_out' => 0.45, 'vision' => true],
+        ['id' => 'qwen2.5-vl-72b-instruct', 'label' => 'Qwen2.5 VL 72B (зрение)', 'provider' => 'yandex', 'full_id' => 'qwen2.5-vl-72b-instruct', 'group' => 'Yandex AI Studio · зрение', 'price_in' => 0.80, 'price_out' => 0.80, 'vision' => true],
+        ['id' => 'deepseek-vl2',      'label' => 'DeepSeek VL 2 (зрение)',      'provider' => 'yandex', 'full_id' => 'deepseek-vl2',      'group' => 'Yandex AI Studio · зрение', 'price_in' => 0.50, 'price_out' => 0.50, 'vision' => true],
+        ['id' => 'deepseek-vl2-tiny', 'label' => 'DeepSeek VL 2 Tiny (зрение)', 'provider' => 'yandex', 'full_id' => 'deepseek-vl2-tiny', 'group' => 'Yandex AI Studio · зрение', 'price_in' => 0.20, 'price_out' => 0.20, 'vision' => true],
         // ── Yandex Vision OCR (PDF text recognition, not a chat model) ──
         ['id' => 'yandex-vision-ocr', 'label' => 'Yandex Vision OCR (PDF)', 'provider' => 'yandex', 'full_id' => 'yandex-ocr-page', 'group' => 'Yandex Vision', 'price_in' => 0.0, 'price_out' => 0.0, 'ocr_only' => true],
         // ── OpenRouter ──
-        ['id' => 'openrouter-deepseek-r1', 'label' => 'DeepSeek R1 (OpenRouter)', 'provider' => 'openrouter', 'full_id' => 'deepseek/deepseek-r1', 'group' => 'OpenRouter', 'price_in' => 50.0, 'price_out' => 200.0],
-        ['id' => 'gpt-4o',           'label' => 'GPT-4o (OpenRouter)',           'provider' => 'openrouter', 'full_id' => 'openai/gpt-4o',                'group' => 'OpenRouter', 'price_in' => 230.0, 'price_out' => 920.0],
-        ['id' => 'gemini-2.0-flash', 'label' => 'Gemini 2.0 Flash (OpenRouter)', 'provider' => 'openrouter', 'full_id' => 'google/gemini-2.0-flash-001', 'group' => 'OpenRouter', 'price_in' => 9.0,   'price_out' => 36.0],
+        ['id' => 'openrouter-deepseek-r1', 'label' => 'DeepSeek R1 (OpenRouter)', 'provider' => 'openrouter', 'full_id' => 'deepseek/deepseek-r1', 'group' => 'OpenRouter', 'price_in' => 50.0, 'price_out' => 200.0, 'vision' => false],
+        ['id' => 'gpt-4o',           'label' => 'GPT-4o (OpenRouter)',           'provider' => 'openrouter', 'full_id' => 'openai/gpt-4o',                'group' => 'OpenRouter', 'price_in' => 230.0, 'price_out' => 920.0, 'vision' => true],
+        ['id' => 'gemini-2.0-flash', 'label' => 'Gemini 2.0 Flash (OpenRouter)', 'provider' => 'openrouter', 'full_id' => 'google/gemini-2.0-flash-001', 'group' => 'OpenRouter', 'price_in' => 9.0,   'price_out' => 36.0, 'vision' => true],
     ],
 ];
 

@@ -20,9 +20,21 @@ require_once __DIR__ . '/settings_store.php';
 require_once __DIR__ . '/mailer.php';
 require_once __DIR__ . '/llm.php';            // model list + auto-fallback preview
 require_once __DIR__ . '/model_catalog.php';  // live provider catalogue
+require_once __DIR__ . '/diag_log.php';       // operator-facing diagnostic log
 
 $cfg   = require __DIR__ . '/config.php';
 $store = new SettingsStore($cfg['DB_PATH']);
+
+// Diagnostic log: same database, wiped whenever the deployed code changes.
+DiagLog::init((string) $cfg['DB_PATH'], DiagLog::codeStamp([
+    __DIR__ . '/llm.php', __DIR__ . '/config.php', __DIR__ . '/model_catalog.php',
+    __DIR__ . '/setup.php', __DIR__ . '/parser.php', __DIR__ . '/mailer.php',
+]));
+DiagLog::addSecret((string) ($cfg['OPENROUTER_API_KEY'] ?? ''));
+DiagLog::addSecret((string) ($cfg['YANDEX_API_KEY'] ?? ''));
+DiagLog::addSecret((string) ($cfg['SMTP_PASS'] ?? ''));
+DiagLog::addSecret((string) ($cfg['ADMIN_PASSWORD'] ?? ''));
+LLM::init($cfg, DiagLog::store());
 
 session_start();
 header('Cache-Control: no-store');
@@ -109,13 +121,34 @@ if ($method === 'POST') {
         } catch (Throwable $e) {
             $messages[] = ['ok' => false, 'text' => '⚠️ SMTP-тест не прошёл: ' . $e->getMessage()];
         }
+    } elseif (isset($_POST['llm_probe'])) {
+        $cfg_live = require __DIR__ . '/config.php';
+        LLM::init($cfg_live, DiagLog::store());
+        foreach (LLM::probe() as $leg) {
+            $messages[] = ['ok' => (bool) $leg['ok'], 'text' => ($leg['ok'] ? '✅ ' : '⛔ ')
+                . $leg['leg'] . ' — ' . $leg['model'] . ': ' . $leg['text']];
+        }
+    } elseif (isset($_POST['diag_clear'])) {
+        DiagLog::clear();
+        DiagLog::info('admin', 'Лог очищен вручную из настроек');
+        $messages[] = ['ok' => true, 'text' => '✅ Лог очищен.'];
     } elseif (($_POST['action'] ?? 'save') === 'save') {
         $edited = [];
+        // Backup models come from three dropdowns; the joined value is always
+        // written (an empty pick MUST be able to clear the list).
+        $picked = [];
+        foreach (['LLM_FALLBACK_MODEL_1', 'LLM_FALLBACK_MODEL_2', 'LLM_FALLBACK_MODEL_3'] as $slot) {
+            $v = trim((string) ($_POST[$slot] ?? ''));
+            if ($v !== '' && !in_array($v, $picked, true)) $picked[] = $v;
+        }
+        if (isset($_POST['LLM_FALLBACK_MODEL_1'])) {
+            $store->setSetting('LLM_FALLBACK_MODELS', implode(',', $picked));
+            $edited[] = 'LLM_FALLBACK_MODELS';
+        }
         // String settings. Empty values never overwrite existing.
         $map = [
             'LLM_PROVIDER', 'LLM_PROVIDER_PRIORITY', 'LLM_DEFAULT_MODEL',
-            'LLM_FALLBACK_MODE', 'LLM_FALLBACK_MODELS', 'MODEL_CATALOG_TTL_MIN',
-            'LLM_VISION_MODEL', 'LLM_FALLBACK_MODEL', 'YANDEX_FALLBACK_MODEL',
+            'LLM_FALLBACK_MODE', 'MODEL_CATALOG_TTL_MIN',
             'LLM_OCR_MODELS', 'YANDEX_OCR_MODEL',
             'OPENROUTER_API_KEY', 'YANDEX_API_KEY', 'YANDEX_FOLDER_ID',
             'ADMIN_EMAIL', 'ERROR_EMAIL',
@@ -125,6 +158,13 @@ if ($method === 'POST') {
         foreach ($map as $k) {
             $v = trim((string) ($_POST[$k] ?? ''));
             if ($v !== '') { $store->setSetting($k, $v); $edited[] = $k; }
+        }
+        // Model dropdowns: «— не задана —» has to be able to clear the value,
+        // so these are written whenever the field was submitted at all.
+        foreach (['LLM_VISION_MODEL', 'LLM_FALLBACK_MODEL', 'YANDEX_FALLBACK_MODEL'] as $k) {
+            if (!isset($_POST[$k])) continue;
+            $store->setSetting($k, trim((string) $_POST[$k]));
+            $edited[] = $k;
         }
         // Checkbox: Yandex Vision OCR. Always written.
         $store->setSetting('YANDEX_OCR_ENABLED', isset($_POST['YANDEX_OCR_ENABLED']) ? '1' : '0');
@@ -155,6 +195,70 @@ $eff = static function (string $k) use ($cfg, $current): string {
     return is_array($v) ? implode(',', $v) : (string) $v;
 };
 $ocr_models_eff = $eff('LLM_OCR_MODELS');
+
+LLM::init($cfg, DiagLog::store());
+
+// ── Model dropdowns ──────────────────────────────────────────────────────
+// Nobody types a slug: every model field is a <select> built from the same
+// catalogue (hardcoded rows + what the providers reported).
+$groups = [];
+foreach ((array) ($cfg['AVAILABLE_MODELS'] ?? []) as $mdl) {
+    if (empty($mdl['ocr_only'])) $groups[(string) ($mdl['group'] ?? 'Модели')][] = $mdl;
+}
+// Price hint: RUB per 1k for hardcoded rows, USD per 1M for live ones (that is
+// how the provider reports it — no invented exchange rate).
+$price = static function (array $m): string {
+    $num = static function (float $v): string { return rtrim(rtrim(number_format($v, 2, '.', ''), '0'), '.'); };
+    $in = (float) ($m['price_in'] ?? 0); $out = (float) ($m['price_out'] ?? 0);
+    if ($in > 0 || $out > 0) return sprintf(' · ~%s/%s ₽ за 1k', $num($in), $num($out));
+    $ui = (float) ($m['price_usd_in'] ?? 0); $uo = (float) ($m['price_usd_out'] ?? 0);
+    if ($ui > 0 || $uo > 0) return sprintf(' · $%s/$%s за 1M', $num($ui), $num($uo));
+    return !empty($m['free']) ? ' · бесплатно' : '';
+};
+/**
+ * One model <select>. $value tells what a row is worth as a stored value —
+ * a short id for LLM_DEFAULT_MODEL, "provider:slug" wherever the provider has
+ * to travel with the slug. A saved value missing from the catalogue is kept as
+ * its own option: otherwise the browser would pick the first row and saving
+ * would silently swap the model.
+ */
+$model_select = static function (string $name, string $current, callable $value, ?callable $filter = null, string $empty = '') use ($groups, $price, $h): string {
+    $html = '<select name="' . $h($name) . '">';
+    if ($empty !== '') {
+        $html .= '<option value=""' . ($current === '' ? ' selected' : '') . '>' . $h($empty) . '</option>';
+    }
+    $known = false;
+    $body = '';
+    foreach ($groups as $gname => $grows) {
+        $rows = $filter === null ? $grows : array_values(array_filter($grows, $filter));
+        if (!$rows) continue;
+        $body .= '<optgroup label="' . $h((string) $gname) . '">';
+        foreach ($rows as $mdl) {
+            $val = (string) $value($mdl);
+            if ($val === $current) $known = true;
+            $body .= '<option value="' . $h($val) . '"' . ($val === $current ? ' selected' : '') . '>'
+                . $h((string) $mdl['label']) . ' — ' . $h((string) $mdl['provider']) . '/' . $h((string) $mdl['full_id'])
+                . $h($price($mdl)) . '</option>';
+        }
+        $body .= '</optgroup>';
+    }
+    if ($current !== '' && !$known) {
+        $html .= '<option value="' . $h($current) . '" selected>' . $h($current) . ' — нет в каталоге</option>';
+    }
+    return $html . $body . '</select>';
+};
+$by_short  = static function (array $m): string { return (string) $m['id']; };
+$by_slug   = static function (array $m): string { return (string) $m['provider'] . ':' . (string) $m['full_id']; };
+$only_vision = static function (array $m): bool { return !empty($m['vision']); };
+$fallback_picked = array_values(array_filter(array_map('trim', explode(',', $eff('LLM_FALLBACK_MODELS')))));
+// A vision model stored as a bare slug (the config default) is shown as the
+// provider-qualified option it resolves to — otherwise a perfectly valid value
+// would render as «нет в каталоге».
+$vision_cur = $eff('LLM_VISION_MODEL');
+if ($vision_cur !== '' && strpos($vision_cur, ':') === false) {
+    $vision_row = LLM::resolveModelSpec($vision_cur);
+    if ($vision_row !== null) $vision_cur = $vision_row['provider'] . ':' . $vision_row['full_id'];
+}
 ?><!doctype html><html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
@@ -198,34 +302,8 @@ $ocr_models_eff = $eff('LLM_OCR_MODELS');
     </label>
   </div>
   <label><span>Модель по умолчанию (каталог: вшитый список + то, что отдал провайдер)</span>
-    <?php
-    $model_cur = $eff('LLM_DEFAULT_MODEL');
-    $groups = [];
-    foreach ((array) ($cfg['AVAILABLE_MODELS'] ?? []) as $mdl) {
-        if (empty($mdl['ocr_only'])) $groups[(string) ($mdl['group'] ?? 'Модели')][] = $mdl;
-    }
-    // Price hint per 1M tokens: RUB for hardcoded rows, USD for live ones
-    // (that is how the provider reports it — no invented exchange rate).
-    $price = static function (array $m): string {
-        $num = static function (float $v): string { return rtrim(rtrim(number_format($v, 2, '.', ''), '0'), '.'); };
-        $in = (float) ($m['price_in'] ?? 0); $out = (float) ($m['price_out'] ?? 0);
-        if ($in > 0 || $out > 0) return sprintf(' · ~%s/%s ₽ за 1k', $num($in), $num($out));
-        $ui = (float) ($m['price_usd_in'] ?? 0); $uo = (float) ($m['price_usd_out'] ?? 0);
-        if ($ui > 0 || $uo > 0) return sprintf(' · $%s/$%s за 1M', $num($ui), $num($uo));
-        return !empty($m['free']) ? ' · бесплатно' : '';
-    };
-    ?>
-    <select name="LLM_DEFAULT_MODEL">
-      <?php foreach ($groups as $gname => $grows): ?>
-        <optgroup label="<?= $h((string) $gname) ?>">
-          <?php foreach ($grows as $mdl): ?>
-            <option value="<?= $h($mdl['id']) ?>" <?= $model_cur === $mdl['id'] ? 'selected' : '' ?>>
-              <?= $h($mdl['label']) ?> — <?= $h($mdl['provider']) ?>/<?= $h($mdl['full_id']) ?><?= $h($price($mdl)) ?>
-            </option>
-          <?php endforeach; ?>
-        </optgroup>
-      <?php endforeach; ?>
-    </select>
+    <?php $model_cur = $eff('LLM_DEFAULT_MODEL'); ?>
+    <?= $model_select('LLM_DEFAULT_MODEL', $model_cur, $by_short) ?>
   </label>
   <?php
   $live_rows   = ModelCatalog::decode((string) ($cfg['MODEL_CATALOG_MODELS'] ?? ''));
@@ -275,10 +353,27 @@ $ocr_models_eff = $eff('LLM_OCR_MODELS');
       У выбранной модели версия в слаге не читается или новее ничего нет — сработает список ниже.
     <?php endif; ?>
   </p>
-  <label><span>Запасные модели (короткие id через запятую; пробуются после выбранной)</span><input type="text" name="LLM_FALLBACK_MODELS" placeholder="<?= $h($eff('LLM_FALLBACK_MODELS') ?: 'например, yandexgpt-lite,gpt-4o') ?>"></label>
-  <label><span>Vision-модель для PDF OCR (OpenRouter full_id)</span><input type="text" name="LLM_VISION_MODEL" placeholder="<?= $h($eff('LLM_VISION_MODEL') ?: 'google/gemini-2.0-flash-001') ?>"></label>
-  <label><span>OpenRouter fallback-модель</span><input type="text" name="LLM_FALLBACK_MODEL" placeholder="<?= $h($eff('LLM_FALLBACK_MODEL') ?: 'openrouter/auto') ?>"></label>
-  <label><span>Yandex fallback-модель (full_id без gpt://)</span><input type="text" name="YANDEX_FALLBACK_MODEL" placeholder="<?= $h($eff('YANDEX_FALLBACK_MODEL') ?: 'deepseek-r1') ?>"></label>
+  <label><span>Запасные модели — выбираются из каталога, пробуются в этом порядке после выбранной</span></label>
+  <div class="row">
+    <?php for ($i = 1; $i <= 3; $i++): ?>
+      <label><span>№<?= $i ?></span>
+        <?= $model_select('LLM_FALLBACK_MODEL_' . $i, (string) ($fallback_picked[$i - 1] ?? ''), $by_short, null, '— не задана —') ?>
+      </label>
+    <?php endfor; ?>
+  </div>
+  <label><span>Vision-модель: фото, этикетки и страницы PDF (OpenRouter и Yandex — только модели со зрением)</span>
+    <?= $model_select('LLM_VISION_MODEL', $vision_cur, $by_slug, $only_vision, '— не задана (значение из config.php) —') ?>
+  </label>
+  <label><span>OpenRouter fallback-модель (последняя попытка на этом провайдере)</span>
+    <?= $model_select('LLM_FALLBACK_MODEL', $eff('LLM_FALLBACK_MODEL'), static function (array $m): string { return (string) $m['full_id']; }, static function (array $m): bool { return ($m['provider'] ?? '') === 'openrouter'; }, '— не задана —') ?>
+  </label>
+  <label><span>Yandex fallback-модель (full_id без gpt://, последняя попытка на этом провайдере)</span>
+    <?= $model_select('YANDEX_FALLBACK_MODEL', $eff('YANDEX_FALLBACK_MODEL'), static function (array $m): string { return (string) $m['full_id']; }, static function (array $m): bool { return ($m['provider'] ?? '') === 'yandex'; }, '— не задана —') ?>
+  </label>
+  <p class="lede" style="margin:-4px 0 8px">
+    Модель, которой нет в живом каталоге провайдера, в запасные не подставляется: слепой запрос к ней
+    отвечает <code>Failed to get model</code> и прячет настоящую причину сбоя.
+  </p>
   <label><span>OCR-модели OpenRouter (через запятую, по порядку)</span><input type="text" name="LLM_OCR_MODELS" placeholder="<?= $h($ocr_models_eff ?: 'google/gemini-2.5-flash,google/gemini-2.0-flash-001') ?>"></label>
   <label><span>Yandex Vision OCR модель</span><input type="text" name="YANDEX_OCR_MODEL" placeholder="<?= $h($eff('YANDEX_OCR_MODEL') ?: 'page') ?>"></label>
   <label style="display:flex;align-items:center;gap:8px;">
@@ -310,6 +405,53 @@ $ocr_models_eff = $eff('LLM_OCR_MODELS');
 
   <p><button type="submit">Сохранить</button></p>
 </form>
+
+<form method="post" autocomplete="off" style="margin-top:18px;">
+  <h2>Проверка провайдеров</h2>
+  <p class="lede">Один короткий запрос к каждой настроенной модели — сразу видно, что именно
+    отвечает провайдер: неверный ключ, чужой каталог, модель не включена в облачном каталоге.
+    Результат попадает и в лог ниже.</p>
+  <p><button type="submit" name="llm_probe" value="1">Проверить модели и ключи</button></p>
+</form>
+
+<?php
+$diag_counts = DiagLog::counts();
+$diag_header = [
+    'приложение'   => 'site_yacloud_openrouter (setup.php)',
+    'php'          => PHP_VERSION . ' на ' . PHP_OS,
+    'база'         => (string) $cfg['DB_PATH'],
+    'код'          => (string) (DiagLog::state('code_stamp') ?? '—')
+        . ', задеплоен ' . (string) (DiagLog::state('deployed_at') ?? '—'),
+    'ключи'        => 'OpenRouter: ' . ($eff('OPENROUTER_API_KEY') !== '' ? DiagLog::maskKey($eff('OPENROUTER_API_KEY')) : 'НЕ ЗАДАН')
+        . '; Yandex: ' . ($eff('YANDEX_API_KEY') !== '' ? DiagLog::maskKey($eff('YANDEX_API_KEY')) : 'НЕ ЗАДАН')
+        . '; folder: ' . ($eff('YANDEX_FOLDER_ID') !== '' ? $eff('YANDEX_FOLDER_ID') : 'НЕ ЗАДАН'),
+];
+foreach (LLM::configSummary() as $k => $v) $diag_header['llm.' . $k] = is_scalar($v) ? (string) $v : json_encode($v);
+$diag_full   = DiagLog::asText(DiagLog::tail(400, false), $diag_header, 'site_yacloud_openrouter — полный лог');
+$diag_errors = DiagLog::asText(DiagLog::tail(400, true), $diag_header, 'site_yacloud_openrouter — только ошибки');
+?>
+<h2>Лог</h2>
+<p class="lede">
+  Записей: <b><?= (int) $diag_counts['total'] ?></b>, из них ошибок и предупреждений: <b><?= (int) $diag_counts['errors'] ?></b>.
+  Лог живёт в той же базе и <b>очищается сам при обновлении кода</b> — то, что здесь видно, относится к текущему деплою.
+  Ключи и пароли в тексте замаскированы, лог можно пересылать как есть.
+</p>
+<div class="row" style="margin-bottom:10px;">
+  <button type="button" onclick="diagCopy('diag-full', this)">Скопировать полный лог</button>
+  <button type="button" onclick="diagCopy('diag-errors', this)">Скопировать только ошибки</button>
+  <form method="post" style="flex:1;margin:0;"><button type="submit" name="diag_clear" value="1" style="width:100%">Очистить лог</button></form>
+</div>
+<label><span>Только ошибки</span><textarea id="diag-errors" readonly rows="10" style="width:100%;font:12px/1.45 ui-monospace,Menlo,Consolas,monospace;background:#131a26;color:#edf1f7;border:1px solid #1f2735;padding:9px 11px;"><?= $h($diag_errors) ?></textarea></label>
+<label><span>Полный лог</span><textarea id="diag-full" readonly rows="16" style="width:100%;font:12px/1.45 ui-monospace,Menlo,Consolas,monospace;background:#131a26;color:#edf1f7;border:1px solid #1f2735;padding:9px 11px;"><?= $h($diag_full) ?></textarea></label>
+<script>
+function diagCopy(id, btn) {
+  var el = document.getElementById(id);
+  var done = function () { var t = btn.textContent; btn.textContent = 'Скопировано'; setTimeout(function () { btn.textContent = t; }, 1500); };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(el.value).then(done, function () { el.select(); document.execCommand('copy'); done(); });
+  } else { el.select(); document.execCommand('copy'); done(); }
+}
+</script>
 
 <form method="post" autocomplete="off" style="margin-top:18px;">
   <h2>Тест SMTP</h2>

@@ -23,7 +23,18 @@ no TZ citations. Specs live in [`spec.md`](spec.md) + `spec/`.
   → Yandex Vision OCR, in operator-chosen priority order.
 - **Model / provider selection in settings** (`setup.php`, `settings_store.php`,
   `config.php`) — admin page writes to a `settings` table; `config.php` overlays
-  whitelisted keys on every request.
+  whitelisted keys on every request. Every model field is a dropdown over the catalogue
+  (default, three backups, per-provider fallbacks, vision), never free text, and
+  "Проверить модели и ключи" runs one real completion per leg so a wrong key or a model
+  the cloud folder does not serve is named immediately.
+- **Vision models of both providers** — `LLM_VISION_MODEL` accepts `"<provider>:<slug>"`,
+  so photos, labels and page scans can go to a Yandex multimodal model
+  (`gemma-3-27b-it`, `qwen2.5-vl-72b-instruct`, `deepseek-vl2`) as well as to OpenRouter.
+- **Diagnostic log** (`diag_log.php`) — every model call, every failure and every
+  self-test lands in a `diag_log` table next to the settings; `setup.php` shows it as two
+  copyable blocks (everything / errors only) with the environment header prepended. API
+  keys are masked, so the text can be pasted into a bug report as is. The log is emptied
+  automatically when the deployed code changes; the `settings` rows are not.
 - **Email sending** (`mailer.php`) — pure-PHP SMTP (AUTH LOGIN, implicit TLS 465 /
   STARTTLS 587), HTML+plain, attachments, throttled error notifications, SMTP test.
 
@@ -39,6 +50,7 @@ site_yacloud_openrouter/
 ├── parser.php          # Parser class — DOCX/PDF extraction + normalization
 ├── mailer.php          # Mailer class — SMTP send (custom/attachment/test/error)
 ├── settings_store.php  # SettingsStore — key/value SQLite store
+├── diag_log.php        # DiagLog — diagnostic log, masked secrets, reset on redeploy
 ├── setup.php           # admin settings page (provider/model/OCR + SMTP)
 ├── example.php         # CLI usage examples
 ├── .env.example
