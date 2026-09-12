@@ -37,10 +37,11 @@ Absent/failing logger never breaks a call (§7).
 
 Model row shape: `['id','label','provider','full_id','price_in','price_out','vision'?,'ocr_only'?,'live'?]`.
 `full_id` semantics: OpenRouter — the model slug sent as-is; Yandex — the slug inside
-`gpt://<YANDEX_FOLDER_ID>/<full_id>/<version>`, where the version segment is added by
-`yandexModelUri()` as `/latest` unless the operator already wrote `/latest`, `/rc` or
-`/deprecated`. `vision` — `true` the model takes images, `false` it does not, absent =
-unknown (treated as «maybe»).
+`gpt://<YANDEX_FOLDER_ID>/<full_id>/latest` (`LLM::yandexModelUri()`). The version
+segment belongs to the address, not to `full_id`: a slug that already carries one
+(`yandexgpt/rc`, `yandexgpt/deprecated`) keeps it, anything else gets `/latest`.
+`vision` — `true` the model takes images, `false` it does not, absent = unknown
+(treated as «maybe»).
 
 ## 3. Entry points
 
@@ -67,6 +68,16 @@ LLM::jsonCompact($v): string                        // JSON_UNESCAPED_UNICODE|SL
 - `chatJson` → `callJson` → `dispatch(json:true)` + `parseJson`. On unparseable JSON:
   one stricter re-ask (`step` suffixed `_retry`, `temp=0.0`, extra user turn demanding a
   single JSON object, no markdown). Still unparseable → `RuntimeException`.
+- `visionJson` → `callVisionJson` — same shape as `callJson` (dispatch + parseJson +
+  one stricter re-ask), but the user turn is multimodal:
+  `visionContent()` builds `[{type:text,...}?, {type:image_url,image_url:{url}}, ...]`
+  from `$userText` + `$imageDataUrls` (each a `data:image/...;base64,...` URI, or a
+  plain https URL). No image bytes are read from disk here — the caller (e.g. a food-photo
+  endpoint) hands over already-encoded `data:` URIs. Goes through the same `dispatch()`
+  fallback chain as `chatJson`: pick a vision-capable model (`setModelOverride` or a
+  vision-capable `LLM_DEFAULT_MODEL`, e.g. `gemini-2.0-flash`) — a candidate that can't
+  read images simply fails its slot (`no_content`/`exception`) and the chain moves on,
+  same as any other `dispatch()` failure (§4).
 - `dispatchPair` — two calls in parallel via `curl_multi` on the **primary** model only
   (spec: `['step','system','user','temp','json']`). Provider not configured → both fall
   back to sequential `callJson`. Per-side transport failure / empty content / unparseable
