@@ -55,7 +55,8 @@ ModelCatalog::newerSiblings(array $row, array $models): array
 - **`decode`** — parses the stored JSON; rows without `id`, `full_id` or `provider` are
   dropped. Used by `config.php` (no network there).
 - **`merge`** — hardcoded rows first. A live row whose `provider|full_id` matches a
-  hardcoded row only sets `live => true` on it; an unknown model is appended. A live row
+  hardcoded row only sets `live => true` on it (and fills in `vision` when the hardcoded row
+  carries no such flag — a curated flag always wins); an unknown model is appended. A live row
   whose short `id` collides with a hardcoded one is skipped. Hardcoded `id` / `group` /
   price are never rewritten, so a saved `LLM_DEFAULT_MODEL` cannot break.
 - **`forget`** — clears all three cache keys; the lists fall back to the hardcoded catalogue.
@@ -87,6 +88,7 @@ OpenRouter `data[]` entries need an `id` containing `/`; everything else is opti
 | `price_usd_in` / `price_usd_out` | OpenRouter `pricing.prompt` / `pricing.completion` × 1e6 (USD per 1M tokens), `0.0` when absent |
 | `context` | `context_length` when present |
 | `free` | `true` when both prices are 0 |
+| `vision` | the model accepts images — OpenRouter: `architecture.input_modalities` contains `image` (older payloads: the input half of `architecture.modality`); Yandex: name heuristic, since `GET /v1/models` answers with slugs only — `*-vl-*`, `*vl2*`, `*vision*`, `llava`, `pixtral`, `gemma-3-{4b,12b,27b}*`, `qwen*-vl*`. A Yandex vision row is also labelled and grouped `· зрение` |
 | `live` | `true` |
 
 Yandex accepts both the OpenAI shape (`{data:[{id}]}`) and `{models:[{modelUri|uri|name}]}`;
