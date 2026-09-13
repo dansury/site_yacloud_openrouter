@@ -37,6 +37,8 @@ if (!function_exists('cfg_settings_whitelist')) {
             'ADMIN_EMAIL', 'ERROR_EMAIL',
             'SMTP_HOST', 'SMTP_PORT', 'SMTP_USER', 'SMTP_PASS', 'SMTP_FROM', 'SMTP_FROM_NAME',
             'ADMIN_PASSWORD',
+            // Auto-pull: the deploy checkbox of active development (auto_pull.php).
+            'AUTOPULL_ENABLED', 'AUTOPULL_INTERVAL', 'AUTOPULL_URL',
         ];
     }
 }
@@ -104,6 +106,13 @@ $config = [
     'SMTP_FROM'             => cfg_env('SMTP_FROM', cfg_env('SMTP_USER', '') ?: ''),
     'SMTP_FROM_NAME'        => cfg_env('SMTP_FROM_NAME', 'site_yacloud_openrouter'),
 
+    /* ── Auto-pull: check GitHub for a newer commit on every page (auto_pull.php).
+       Credentials are NOT here — repo, token and the pull.php password live in
+       pull-config.php next to pull.php. ── */
+    'AUTOPULL_ENABLED'      => cfg_env('AUTOPULL_ENABLED', '0'),
+    'AUTOPULL_INTERVAL'     => (int) cfg_env('AUTOPULL_INTERVAL', '0'),  // 0 — every page view
+    'AUTOPULL_URL'          => cfg_env('AUTOPULL_URL', ''),              // empty — derive from DOCUMENT_ROOT
+
     /* ── Storage ── */
     'DB_PATH'               => cfg_env('DB_PATH', __DIR__ . '/data/app.db'),
     'LOG_DIR'               => cfg_env('LOG_DIR', __DIR__ . '/data/logs'),
@@ -149,7 +158,7 @@ $config = [
     $dbPath = $config['DB_PATH'];
     if (!is_string($dbPath) || !file_exists($dbPath)) return;
     $overlayKeys = cfg_settings_whitelist();
-    $intKeys = ['SMTP_PORT'];
+    $intKeys = ['SMTP_PORT', 'AUTOPULL_INTERVAL'];
     $csvKeys = ['LLM_OCR_MODELS']; // stored comma-separated, consumed as array
     try {
         $pdo = new PDO('sqlite:' . $dbPath);

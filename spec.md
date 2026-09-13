@@ -51,6 +51,7 @@
 | `/spec/mailer.md`   | `mailer.php` — SMTP transport, MIME building, attachments, error notifications |
 | `/spec/settings.md` | `config.php`, `settings_store.php`, `setup.php` — config resolution, `settings` table, admin page |
 | `/spec/diag_log.md` | `diag_log.php` — diagnostic log, redaction, reset on redeploy |
+| `/spec/auto_pull.md` | `auto_pull.php` — silent GitHub head check on every page, deploy through `pull.php`, redirect back |
 
 ---
 
@@ -66,6 +67,7 @@
 | `settings_store.php` | `/spec/settings.md` |
 | `diag_log.php`       | `/spec/diag_log.md` |
 | `setup.php`          | `/spec/settings.md` |
+| `auto_pull.php`      | `/spec/auto_pull.md` |
 | `example.php`        | `/spec/llm.md` §6 (CLI smoke modes) |
 
 ---
@@ -83,5 +85,6 @@ absent → PDF goes straight to OCR.
 |---|---|
 | `DB_PATH` (default `data/app.db`) | SQLite; table `settings` (see `/spec/settings.md` §2) — also holds the cached model catalogue (`/spec/model_catalog.md` §2) and the diagnostic log (`/spec/diag_log.md` §1) |
 | `LOG_DIR` (default `data/logs`)   | `error_email_throttle.json` (see `/spec/mailer.md` §5) |
+| `dirname(DB_PATH)` | `auto-pull.json` — last deploy check (see `/spec/auto_pull.md` §4) |
 
 Both are gitignored (`data/*.db`, `data/logs/`).

@@ -21,6 +21,7 @@ require_once __DIR__ . '/mailer.php';
 require_once __DIR__ . '/llm.php';            // model list + auto-fallback preview
 require_once __DIR__ . '/model_catalog.php';  // live provider catalogue
 require_once __DIR__ . '/diag_log.php';       // operator-facing diagnostic log
+require_once __DIR__ . '/auto_pull.php';      // silent "is the deployed code the latest?" check
 
 $cfg   = require __DIR__ . '/config.php';
 $store = new SettingsStore($cfg['DB_PATH']);
@@ -85,6 +86,15 @@ if (empty($_SESSION['admin_authed'])) {
     exit;
 }
 
+// Auto-pull options: the switch lives in `settings`, the credentials in
+// pull-config.php next to pull.php. The state file goes to the data directory —
+// the web root is what a deploy overwrites.
+$autopull_opts = AutoPull::options($cfg, ['state_dir' => dirname((string) $cfg['DB_PATH'])]);
+
+// Silent check on every view of this page: a newer commit is deployed and the
+// page is reloaded from the new code. Nothing is printed when there is nothing to do.
+AutoPull::run($autopull_opts);
+
 $messages = [];
 $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
 
@@ -110,6 +120,12 @@ if ($method === 'POST') {
                 $messages[] = ['ok' => false, 'text' => '⚠️ Каталог моделей не получен: ' . $e->getMessage()];
             }
         }
+    } elseif (isset($_POST['autopull_check'])) {
+        $rep = AutoPull::check($autopull_opts, true);
+        $messages[] = $rep['ok']
+            ? ['ok' => true, 'text' => '✅ Автообновление: ' . $rep['note']
+                . ' (head ' . substr($rep['head'], 0, 7) . ').']
+            : ['ok' => false, 'text' => '⚠️ Автообновление: ' . $rep['error']];
     } elseif (isset($_POST['smtp_test'])) {
         // Test letter via the CURRENT saved settings (re-read overlay).
         $cfg_live = require __DIR__ . '/config.php';
@@ -165,6 +181,13 @@ if ($method === 'POST') {
             if (!isset($_POST[$k])) continue;
             $store->setSetting($k, trim((string) $_POST[$k]));
             $edited[] = $k;
+        }
+        // Auto-pull: the checkbox and its two knobs are always written, so both
+        // «выключить» and «очистить адрес» actually take effect.
+        $store->setSetting('AUTOPULL_ENABLED', isset($_POST['AUTOPULL_ENABLED']) ? '1' : '0');
+        $edited[] = 'AUTOPULL_ENABLED=' . (isset($_POST['AUTOPULL_ENABLED']) ? '1' : '0');
+        foreach (['AUTOPULL_INTERVAL', 'AUTOPULL_URL'] as $k) {
+            if (isset($_POST[$k])) $store->setSetting($k, trim((string) $_POST[$k]));
         }
         // Checkbox: Yandex Vision OCR. Always written.
         $store->setSetting('YANDEX_OCR_ENABLED', isset($_POST['YANDEX_OCR_ENABLED']) ? '1' : '0');
@@ -400,10 +423,51 @@ if ($vision_cur !== '' && strpos($vision_cur, ':') === false) {
   <label><span>ADMIN_EMAIL (получатель копий/вложений)</span><input type="text" name="ADMIN_EMAIL" placeholder="<?= $h($eff('ADMIN_EMAIL')) ?>"></label>
   <label><span>ERROR_EMAIL (уведомления об ошибках)</span><input type="text" name="ERROR_EMAIL" placeholder="<?= $h($eff('ERROR_EMAIL')) ?>"></label>
 
+  <h2>Автообновление кода с GitHub</h2>
+  <?php
+  $ap_status = AutoPull::status($autopull_opts);
+  $ap_root   = AutoPull::root($autopull_opts);
+  $ap_cfg    = AutoPull::pullConfig($ap_root);
+  ?>
+  <p class="lede" style="margin:-4px 0 10px">
+    На время активной разработки: каждое открытие страницы тихо спрашивает у GitHub head
+    отслеживаемой ссылки. Тот же коммит — не происходит ничего; новый — <code>pull.php</code>
+    выкладывает его, и страница открывается заново уже на новом коде. Репозиторий, токен и
+    пароль <code>pull.php</code> берутся из <code>pull-config.php</code> рядом со скриптом —
+    здесь их дублировать не нужно.
+    <?php if ($ap_cfg === null): ?>
+      <br><span style="color:#ff4560">pull-config.php не найден (искали в <?= $h($ap_root) ?>) — включать нечего.</span>
+    <?php else: ?>
+      <br>Отслеживается: <b><?= $h($ap_cfg['repo']) ?></b> ·
+      <?= $ap_cfg['source'] === 'pr' ? 'PR #' . (int) $ap_cfg['pr_number'] : 'ветка ' . $h($ap_cfg['branch']) ?>.
+    <?php endif; ?>
+    <?php if ($ap_status['checked_at'] > 0): ?>
+      <br>Последняя проверка: <?= $h(date('Y-m-d H:i:s', $ap_status['checked_at'])) ?>
+      <?= $ap_status['note'] !== '' ? '— ' . $h($ap_status['note']) : '' ?>.
+    <?php endif; ?>
+    <?php if ($ap_status['error'] !== ''): ?>
+      <br><span style="color:#ff4560">Ошибка: <?= $h(mb_substr($ap_status['error'], 0, 200)) ?></span>
+    <?php endif; ?>
+  </p>
+  <label style="display:flex;align-items:center;gap:10px;">
+    <input type="checkbox" name="AUTOPULL_ENABLED" value="1" style="width:auto;" <?= $eff('AUTOPULL_ENABLED') === '1' ? 'checked' : '' ?>>
+    <span style="margin:0;">Проверять обновления при каждом запуске сервиса</span>
+  </label>
+  <div class="row">
+    <label><span>Не чаще, сек (0 — при каждом открытии страницы)</span><input type="text" name="AUTOPULL_INTERVAL" value="<?= $h($eff('AUTOPULL_INTERVAL')) ?>"></label>
+    <label><span>Адрес pull.php (пусто — вычисляется сам)</span><input type="text" name="AUTOPULL_URL" value="<?= $h($eff('AUTOPULL_URL')) ?>" placeholder="https://сайт/pull.php"></label>
+  </div>
+
   <h2>Доступ</h2>
   <label><span>Пароль администратора (ADMIN_PASSWORD)</span><input type="password" name="ADMIN_PASSWORD" placeholder="<?= $h($mask($eff('ADMIN_PASSWORD'))) ?>"></label>
 
   <p><button type="submit">Сохранить</button></p>
+</form>
+
+<form method="post" autocomplete="off" style="margin-top:18px;">
+  <h2>Проверить обновление сейчас</h2>
+  <p class="lede" style="margin:-4px 0 10px">Спрашивает head у GitHub и, если коммит новее выложенного, запускает <code>pull.php</code> — независимо от галочки выше.</p>
+  <p><button type="submit" name="autopull_check" value="1">Проверить и обновить</button></p>
 </form>
 
 <form method="post" autocomplete="off" style="margin-top:18px;">
