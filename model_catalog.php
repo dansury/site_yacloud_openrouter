@@ -67,7 +67,15 @@ final class ModelCatalog {
         foreach ($builtin as $r) $ids[(string) ($r['id'] ?? '')] = true;
         foreach ($live as $r) {
             $key = self::slugKey((string) $r['provider'], (string) $r['full_id']);
-            if (isset($bySlug[$key])) { $builtin[$bySlug[$key]]['live'] = true; continue; }
+            if (isset($bySlug[$key])) {
+                $builtin[$bySlug[$key]]['live'] = true;
+                // The curated row keeps its own vision flag; a row without one
+                // inherits what the provider says.
+                if (!isset($builtin[$bySlug[$key]]['vision']) && isset($r['vision'])) {
+                    $builtin[$bySlug[$key]]['vision'] = (bool) $r['vision'];
+                }
+                continue;
+            }
             if (isset($ids[(string) $r['id']])) continue;   // short-id collision
             $ids[(string) $r['id']] = true;
             $bySlug[$key] = count($builtin);
@@ -244,6 +252,7 @@ final class ModelCatalog {
                 'price_usd_in'  => $pin,
                 'price_usd_out' => $pout,
                 'context'       => (int) ($m['context_length'] ?? 0),
+                'vision'        => self::openRouterSeesImages($m),
                 'live'          => true,
             ];
             if ($pin === 0.0 && $pout === 0.0) $row['free'] = true;
@@ -284,18 +293,58 @@ final class ModelCatalog {
             }
             $slug = self::yandexSlug($raw, $folder);
             if ($slug === null) continue;
+            $vision = self::yandexSeesImages($slug);
             $rows[] = [
                 'id'       => 'ya-' . self::shortId($slug),
-                'label'    => $slug,
+                'label'    => $slug . ($vision ? ' (зрение)' : ''),
                 'provider' => 'yandex',
                 'full_id'  => $slug,
-                'group'    => 'Yandex AI Studio (каталог)',
+                'group'    => 'Yandex AI Studio (каталог)' . ($vision ? ' · зрение' : ''),
                 'price_in' => 0.0, 'price_out' => 0.0,
+                'vision'   => $vision,
                 'live'     => true,
             ];
         }
         if (!$rows) throw new RuntimeException('no models in the response');
         return $rows;
+    }
+
+    /**
+     * Does an OpenRouter row accept images? The catalogue states it outright —
+     * `architecture.input_modalities: ["text","image"]` on current payloads,
+     * `architecture.modality: "text+image->text"` on older ones.
+     */
+    private static function openRouterSeesImages(array $m): bool {
+        $arch = isset($m['architecture']) && is_array($m['architecture']) ? $m['architecture'] : [];
+        $inputs = $arch['input_modalities'] ?? null;
+        if (is_array($inputs)) {
+            foreach ($inputs as $mod) {
+                if (is_string($mod) && strtolower($mod) === 'image') return true;
+            }
+            return false;
+        }
+        $modality = isset($arch['modality']) && is_string($arch['modality']) ? strtolower($arch['modality']) : '';
+        if ($modality !== '') {
+            $in = explode('->', $modality)[0];
+            return strpos($in, 'image') !== false;
+        }
+        return false;
+    }
+
+    /**
+     * Yandex `GET /v1/models` answers with slugs only — no modality field — so
+     * the multimodal families are recognized by name: the VL / vision lines and
+     * Gemma 3 (its 4b/12b/27b instruct weights take images).
+     */
+    private static function yandexSeesImages(string $slug): bool {
+        $s = strtolower($slug);
+        $marks = ['-vl-', '-vl2', 'vl2-', '-vision', 'vision-', 'llava', 'pixtral'];
+        foreach ($marks as $mark) {
+            if (strpos($s, $mark) !== false) return true;
+        }
+        if (preg_match('~^gemma-3-(4b|12b|27b)~', $s)) return true;
+        if (preg_match('~^qwen[0-9.]*-vl~', $s)) return true;
+        return false;
     }
 
     /** "gpt://<folder>/yandexgpt/latest" → "yandexgpt". Another folder → not ours. */
