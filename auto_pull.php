@@ -27,6 +27,15 @@ final class AutoPull {
     public const DEPLOY_TIMEOUT_SEC = 300;
 
     /**
+     * Give up waiting for pull.php after this many seconds of complete silence.
+     * A host that serves one PHP request at a time keeps ours busy, so its answer
+     * never starts — but pull.php sets ignore_user_abort(true), so it deploys
+     * anyway once a worker frees up. Waiting out the full timeout would freeze the
+     * page for nothing; we stop listening and say so.
+     */
+    public const DEPLOY_SILENCE_SEC = 20;
+
+    /**
      * Page hook. Call it before any output, as early in the bootstrap as possible.
      *
      * $opts:
@@ -121,6 +130,15 @@ final class AutoPull {
         self::unlock($lock);
 
         $report['output'] = $output;
+        if ($ok === null) {
+            // Answer never arrived, but pull.php runs to the end on its own. The
+            // commit counts as deployed — the page just cannot show it yet.
+            $report['ok']       = true;
+            $report['deployed'] = $head;
+            $report['note']     = 'деплой идёт в фоне (хостинг занят этим же запросом) — страница обновится при следующем заходе';
+            // Пауза, чтобы соседние заходы не запустили второй деплой поверх идущего.
+            return self::finish($opts, $state, $report, '', true, self::COOLDOWN_SEC);
+        }
         if (!$ok) {
             return self::finish($opts, $state, $report, 'pull.php не выложил обновление: ' . $derr);
         }
@@ -272,7 +290,11 @@ final class AutoPull {
         return [(string)($state['deployed'] ?? ''), false];
     }
 
-    /** Runs pull.php over HTTP with the credentials from pull-config.php: [ok, output, error]. */
+    /**
+     * Runs pull.php over HTTP with the credentials from pull-config.php.
+     * @return array{0: bool|null, 1: string, 2: string} ok (null = started but
+     *         unconfirmed, see DEPLOY_SILENCE_SEC), last of the output, error.
+     */
     private static function deploy(string $root, array $cfg, array $opts): array {
         if (!is_file($root . '/pull.php')) return [false, '', 'pull.php не найден в ' . $root];
 
@@ -298,6 +320,16 @@ final class AutoPull {
             CURLOPT_CONNECTTIMEOUT => 10,
             CURLOPT_HTTPHEADER     => $headers,
         ]);
+        // pull.php prints as it works, so total silence means it has not started —
+        // the host is busy with THIS request. Stop listening instead of freezing the
+        // page for the whole timeout; the deploy itself runs on regardless
+        // (pull.php sets ignore_user_abort(true)).
+        $since = microtime(true);
+        curl_setopt($ch, CURLOPT_NOPROGRESS, false);
+        curl_setopt($ch, CURLOPT_XFERINFOFUNCTION,
+            static function ($handle, $dlTotal, $dlNow) use ($since): int {
+                return ($dlNow <= 0 && microtime(true) - $since > self::DEPLOY_SILENCE_SEC) ? 1 : 0;
+            });
         $body  = (string)curl_exec($ch);
         $errno = curl_errno($ch);
         $err   = curl_error($ch);
@@ -305,6 +337,11 @@ final class AutoPull {
         curl_close($ch);
 
         $tail = trim(mb_substr($body, -600));
+        // 42 — our own "silence" abort above, 28 — the whole timeout ran out
+        // mid-deploy. In both cases pull.php keeps working without us.
+        if ($errno === 42 || $errno === CURLE_OPERATION_TIMEDOUT) {
+            return [null, $tail, 'ответа pull.php не дождались'];
+        }
         if ($errno !== 0)  return [false, $tail, 'curl ' . $errno . ': ' . $err];
         if ($code === 401) return [false, $tail, 'pull.php просит пароль — в pull-config.php нет его хеша'];
         if ($code === 403) return [false, $tail, 'pull.php: 403 (IP не в списке разрешённых)'];
@@ -353,7 +390,7 @@ final class AutoPull {
     }
 
     /** Remembers the outcome and returns the report. $error also starts the cooldown. */
-    private static function finish(array $opts, array $state, array $report, string $error, bool $write = true): array {
+    private static function finish(array $opts, array $state, array $report, string $error, bool $write = true, int $cooldown = 0): array {
         if ($error !== '') {
             $report['ok']    = false;
             $report['error'] = $error;
@@ -367,7 +404,8 @@ final class AutoPull {
         $state['note']       = $report['note'];
         $state['output']     = $report['output'];
         if ($report['deployed_now']) $state['deployed_at'] = $report['checked_at'];
-        $state['cooldown_until'] = $error !== '' ? time() + self::COOLDOWN_SEC : 0;
+        $pause = $error !== '' ? self::COOLDOWN_SEC : $cooldown;
+        $state['cooldown_until'] = $pause > 0 ? time() + $pause : 0;
 
         $json = json_encode($state, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
         if ($json !== false) {

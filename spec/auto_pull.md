@@ -62,7 +62,14 @@ AutoPull::pullConfig(string $root): ?array                // parsed pull-config.
    key = password_hash)>`, the token `pull.php` itself issues, so the plaintext password is
    never needed; else legacy `secret` → `?token=<secret>`; else nothing. Failure = curl
    error, HTTP ≥ 400, or a `STATUS: FAILED` line in the answer.
-7. State written; an error sets `cooldown_until = now + COOLDOWN_SEC` (120 s).
+7. A host that serves one PHP request at a time is busy with *this* one, so `pull.php`
+   never answers. `pull.php` prints as it works, so `DEPLOY_SILENCE_SEC` = 20 s without a
+   single byte (curl progress callback) aborts the wait instead of freezing the page for
+   the whole timeout — `pull.php` sets `ignore_user_abort(true)` and deploys anyway once a
+   worker frees up. The commit is then recorded as deployed with the note «деплой идёт в
+   фоне», there is no redirect (the new code is not live yet) and a `COOLDOWN_SEC` pause
+   keeps the next page views from starting a second deploy over the running one.
+8. State written; an error sets `cooldown_until = now + COOLDOWN_SEC` (120 s).
 
 ## 4. State file
 
@@ -94,7 +101,8 @@ of the checkbox.
 
 - One GitHub API call per page view at `AUTOPULL_INTERVAL = 0`: 5000 req/h with a token,
   60 req/h without one. Raise the interval if the limit is near.
-- The deploy is a second HTTP request to the same host: a host that serves one PHP request
-  at a time will stall it until the timeout, and the check reports the failure.
+- The deploy is a second HTTP request to the same host. Where the host serves one PHP
+  request at a time, the first page view after a push waits `DEPLOY_SILENCE_SEC` and then
+  renders the old code; the deploy finishes in the background and the next view is new.
 - Not a cron replacement. Nobody opens a page, nothing is deployed — for an unattended
   server use `pull.php?check=1` from cron.
