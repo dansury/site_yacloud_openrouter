@@ -24,6 +24,10 @@ no TZ citations. Specs live in [`spec.md`](spec.md) + `spec/`.
 - **Model / provider selection in settings** (`setup.php`, `settings_store.php`,
   `config.php`) — admin page writes to a `settings` table; `config.php` overlays
   whitelisted keys on every request.
+- **Auto-pull while developing** (`auto_pull.php`) — one checkbox in `setup.php`: every
+  page view quietly asks GitHub for the head of the ref `pull.php` tracks, and a newer
+  commit is deployed through `pull.php` before the page is reloaded from it. Repo, token
+  and the `pull.php` password come from `pull-config.php` — nothing is duplicated.
 - **Email sending** (`mailer.php`) — pure-PHP SMTP (AUTH LOGIN, implicit TLS 465 /
   STARTTLS 587), HTML+plain, attachments, throttled error notifications, SMTP test.
 
@@ -39,11 +43,12 @@ site_yacloud_openrouter/
 ├── parser.php          # Parser class — DOCX/PDF extraction + normalization
 ├── mailer.php          # Mailer class — SMTP send (custom/attachment/test/error)
 ├── settings_store.php  # SettingsStore — key/value SQLite store
+├── auto_pull.php       # AutoPull — silent deploy check on every page (pull.php + pull-config.php)
 ├── setup.php           # admin settings page (provider/model/OCR + SMTP)
 ├── example.php         # CLI usage examples
 ├── .env.example
 ├── spec.md             # spec navigation index
-├── spec/               # per-module specs (llm, model_catalog, parser, mailer, settings)
+├── spec/               # per-module specs (llm, model_catalog, parser, mailer, settings, auto_pull)
 └── data/               # SQLite DB + logs (gitignored)
 ```
 
