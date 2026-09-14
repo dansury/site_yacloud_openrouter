@@ -29,6 +29,9 @@ Absent/failing logger never breaks a call (§7).
 | `findModel(string $shortId): ?array`   | row from `AVAILABLE_MODELS` by `id`, else `null` |
 | `resolveModelSpec(string $spec): ?array` | `"yandex:<slug>"` \| short `id` \| bare `full_id` → row. A provider-qualified slug absent from the catalogue still resolves, keeping its stated provider |
 | `rowIsVision(array $row): bool`        | row accepts images; missing `vision` key = «maybe» (never skipped) |
+| `catalogueRow(string $p, string $slug): ?array` *(private)* | the catalogue row for provider+slug (live and hardcoded share the slug after `ModelCatalog::merge()`), carrying its `live` / `vision` flags |
+| `rowIsDead(array $row): bool` *(private)* | the provider answered its catalogue and did not list this row (§4.1) |
+| `hasLiveRows(string $p): bool` *(private)* | the catalogue holds at least one provider-confirmed row for `$p` |
 | `visionModelRow(): ?array`             | `LLM_VISION_MODEL` through `resolveModelSpec`, `ocr_only` rows rejected |
 | `visionModelRows(): array`             | every row with `vision === true` — the vision fallback pool and the admin dropdown |
 | `configSummary(): array`               | non-secret snapshot of provider/model/key state, attached to every failure |
@@ -52,6 +55,8 @@ LLM::visionJson(string $system, string $userText, array $imageDataUrls, ?int $se
 LLM::probe(): array                                 // provider self-test, never throws
 LLM::lastTrace(): array                             // per-candidate outcome of the last dispatch
 LLM::traceText(): string
+LLM::failureReason(?array $trace = null): string    // one sentence per provider, for the end user (§4.3)
+LLM::candidateChain(bool $vision): array            // who would be asked, without asking (§4.1)
 LLM::dispatchPair(array $specA, array $specB, ?int $sessionId): array   // [parsedA, parsedB]
 LLM::ocrPdf(string $pdfPath): ?string
 LLM::render(string $tpl, array $vars): string       // {{token}} substitution
@@ -84,9 +89,13 @@ LLM::jsonCompact($v): string                        // JSON_UNESCAPED_UNICODE|SL
   JSON → that side is retried through `callJson`, so the fallback chain and the JSON
   re-ask still apply. Statuses logged: `multi_fail`, `multi_no_content`, `ok`.
 
-## 4. Fallback chain — `dispatch()`
+## 4. Fallback chain — `candidateChain()` + `dispatch()`
 
-`dispatch($step, $messages, $sessionId, $temp, $json, $vision = false)`.
+### 4.1 Who gets asked — `candidateChain(bool $vision): array`
+
+`['primary' => row, 'candidates' => [row…], 'skipped' => [trace…]]`. Public and pure
+over the config — no network — so an admin page or a test reads exactly the chain the
+dispatch walks (`tests/llm_chain.php`).
 
 Candidates, in order:
 
@@ -103,22 +112,34 @@ Candidates, in order:
    dropped). With `LLM_FALLBACK_MODE=manual` this is the only configured backup.
 4. When `$vision`: every `visionModelRows()` row (the whole known-multimodal pool).
 5. For each provider in `providerPriority()`, its per-provider fallback model
-   (`LLM_FALLBACK_MODEL` for openrouter, `YANDEX_FALLBACK_MODEL` for yandex) — **skipped
-   when the provider has live catalogue rows and the slug is not among them**
-   (`slugInCatalogue()` / `hasLiveRows()`). A blind fallback the cloud folder does not
-   serve answers `Failed to get model` and masks the real reason the chain got that far;
-   the skip is recorded in the trace as `пропущен: модели нет в каталоге провайдера`.
+   (`LLM_FALLBACK_MODEL` for openrouter, `YANDEX_FALLBACK_MODEL` for yandex), resolved
+   through `catalogueRow()` so the row carries the catalogue's `live` / `vision` flags —
+   no row there, the slug travels as the operator wrote it.
 
-When `$vision`, every candidate whose row says `vision === false` is dropped
-(`rowIsVision()`), so a photo never burns attempts on text-only models.
+Dropped along the way, each with its reason in `skipped` (`['candidate' => …,
+'result' => 'пропущен: …']`, merged into the trace by `dispatch()`):
 
-Steps 2–4 keep each row's own provider — **a slug never travels to the other provider**.
-A provider is skipped when its credentials are absent (openrouter: `OPENROUTER_API_KEY`;
-yandex: `YANDEX_API_KEY` **and** `YANDEX_FOLDER_ID`); a candidate identical to the primary
-`full_id` on the primary provider is skipped, and the final list is deduplicated by
-`provider|full_id` so no pair is attempted twice.
+| Filter | Dropped when | Reason recorded |
+|---|---|---|
+| `rowIsDead($row)` | the provider answered its catalogue (`hasLiveRows()`) and did not list this slug (`live` unset) | `провайдер не назвал эту модель в своём каталоге` |
+| `rowIsVision($row)` | `$vision` and the row does not take images | `модель не принимает изображения` |
+| credentials | openrouter without `OPENROUTER_API_KEY`; yandex without `YANDEX_API_KEY` **and** `YANDEX_FOLDER_ID` | *(silent — nothing was configured)* |
 
-Walk candidates in order; each attempt is logged with `provider:full_id` as the model tag:
+`rowIsDead()` is the verdict the admin page draws with ⛔: every such request comes back
+`Failed to get model` and buries the real reason the chain got that far. The **hardcoded**
+`AVAILABLE_MODELS` list does not vouch for a slug — it ages with the release, the live
+answer does not; a provider whose catalogue never arrived proves nothing and its rows stay
+usable. The **chosen** model is never dropped: it is an explicit decision.
+
+Steps 2–5 keep each row's own provider — **a slug never travels to the other provider**.
+A candidate identical to the primary `full_id` on the primary provider is skipped, and the
+final list is deduplicated by `provider|full_id` so no pair is attempted twice.
+
+### 4.2 Who actually answers — `dispatch()`
+
+`dispatch($step, $messages, $sessionId, $temp, $json, $vision = false)` walks
+`candidateChain($vision)['candidates']` in order; each attempt is logged with
+`provider:full_id` as the model tag:
 
 | Outcome | Status logged | Action |
 |---|---|---|
@@ -127,14 +148,38 @@ Walk candidates in order; each attempt is logged with `provider:full_id` as the 
 | no `choices[0].message.content` | `no_content` | next candidate |
 | transport/HTTP ≥ 400 / throw | `exception` | next candidate |
 
-Each attempt also lands in `self::$trace` (`lastTrace()` / `traceText()`):
-`['candidate' => 'provider:slug', 'result' => …, 'latency_ms' => …]`.
+Every attempt lands in `self::$trace` (`lastTrace()` / `traceText()`):
+`['candidate' => 'provider:slug', 'result' => …, 'latency_ms' => …]`, on top of the
+`skipped` lines the chain already produced.
+
+**A provider that refused for a reason that is not about the model is dropped for the rest
+of the chain.** `LLMHttpError::providerWide()` decides (§5); non-`null` → every remaining
+candidate of that provider is recorded as `пропущен: <reason>` without a request. Asking
+them anyway spends a second each and buries the real cause.
 
 All candidates exhausted → `RuntimeException` carrying the **whole chain**, not the last
 error alone: `"LLM <step> failed (<n> попыток): [1] <provider:slug> → <error>; [2] …"`.
 (With `openrouter → yandex`, the last line used to be all the operator saw, so a missing
 OpenRouter key read as a Yandex problem.) The same failure is written to the diagnostic
 log with `configSummary()` attached — `/spec/diag_log.md`.
+
+### 4.3 What the person waiting is told — `failureReason(?array $trace = null): string`
+
+The numbered chain belongs in the admin log, not on a phone screen. Attempts are grouped
+by provider and reduced to a cause (`causeOf()`, private), so ten `Failed to get model`
+read as one `yandex: модели не включены в каталоге облака`. Format:
+`"<provider>: <cause>[, <cause>…][; <provider>: …]"`, empty string when the last dispatch
+did not fail. `$trace` defaults to the last dispatch's.
+
+| Provider answer contains | Cause |
+|---|---|
+| `пропущен:` (prefix) | *(none — a model we chose not to ask is not a failure)* |
+| `Failed to get model` | `модель не включена в каталоге облака` |
+| `Access denied by security policy` | `запрос блокирует хостинг` |
+| `HTTP 401` / `HTTP 403` / `HTTP 429` | `ключ не принят` / `доступ к модели запрещён` / `превышен лимит запросов` |
+| `text is empty`, `empty message text` | `модель не приняла изображение` |
+| `not configured` / `timed out`, `timeout` / `HTTP 5xx` | `провайдер не настроен` / `провайдер не ответил вовремя` / `провайдер отвечает ошибкой` |
+| anything else | `провайдер отказал` |
 
 **Cross-provider notification.** When the primary provider was `openrouter` and a
 `yandex` candidate served the call, `notifyOpenRouterFallback()` fires
@@ -154,10 +199,23 @@ class is loaded; any error inside is swallowed.
 Body: `{model, messages, temperature}` + `response_format={"type":"json_object"}` when
 `$jsonMode` + any `$extra` keys merged in (used by OCR strategies). Timeouts:
 `CURLOPT_TIMEOUT = LLM_TIMEOUT_SEC`, `CURLOPT_CONNECTTIMEOUT = 15`. Missing credentials →
-throws before the request. HTTP ≥ 400 or transport error → `RuntimeException`
+throws before the request. HTTP ≥ 400 or transport error → `LLMHttpError` (extends `RuntimeException`)
 `"<PROVIDER> HTTP <code> @ <url> model=<model string>[ json_object]: <curl error | first
 400 chars of body>"` — the endpoint and the model string as the provider saw it are part
 of the message, because `YANDEX HTTP 400: Failed to get model` alone names no model.
+
+`final class LLMHttpError` carries `$provider`, `$status` and `$body` (first 2000 chars)
+next to the message, so the chain can tell one dead model from a whole provider leg:
+
+```php
+LLMHttpError::providerWide(): ?string   // null = this is about the model asked for
+```
+
+`401`/`407` → `ключ провайдера отклонён`. `403` → `null` when the body is the provider's
+own error envelope (`{"error":{…}}`), otherwise `запрос к провайдеру заблокирован на
+подступах (хостинг или прокси)` — a bare string or an HTML page under 403 comes from
+something standing in front of the provider (hosting WAF, proxy), not from it. Every other
+status → `null`. Used by `dispatch()` (§4.2).
 
 Response helpers: `extractContent()` reads `choices[0].message.content`, joining
 `[{text:…}]` parts with `\n`; `parseJson()` strips ```` ```json ```` fences, then tries the
