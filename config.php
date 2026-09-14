@@ -61,7 +61,7 @@ $config = [
     /* ── OpenRouter ── (supply key via ENV or setup.php) */
     'OPENROUTER_API_KEY'    => cfg_env('OPENROUTER_API_KEY', ''),
     'OPENROUTER_URL'        => 'https://openrouter.ai/api/v1/chat/completions',
-    'LLM_VISION_MODEL'      => cfg_env('LLM_VISION_MODEL', 'google/gemini-2.0-flash-001'),
+    'LLM_VISION_MODEL'      => cfg_env('LLM_VISION_MODEL', 'yandex:qwen3.6-35b-a3b'),
     'LLM_FALLBACK_MODEL'    => cfg_env('LLM_FALLBACK_MODEL', 'openrouter/auto'),
     'YANDEX_FALLBACK_MODEL' => cfg_env('YANDEX_FALLBACK_MODEL', 'deepseek-r1'),
     /* ── Live model catalogue ─────────────────────────────────────────────
@@ -138,6 +138,9 @@ $config = [
         ['id' => 'gemma-3-12b-it',  'label' => 'Gemma 3 12B IT (зрение)',  'provider' => 'yandex', 'full_id' => 'gemma-3-12b-it',  'group' => 'Yandex AI Studio · зрение', 'price_in' => 0.30, 'price_out' => 0.30, 'vision' => true],
         ['id' => 'gemma-3-27b-it',  'label' => 'Gemma 3 27B IT (зрение)',  'provider' => 'yandex', 'full_id' => 'gemma-3-27b-it',  'group' => 'Yandex AI Studio · зрение', 'price_in' => 0.45, 'price_out' => 0.45, 'vision' => true],
         ['id' => 'qwen2.5-vl-72b-instruct', 'label' => 'Qwen2.5 VL 72B (зрение)', 'provider' => 'yandex', 'full_id' => 'qwen2.5-vl-72b-instruct', 'group' => 'Yandex AI Studio · зрение', 'price_in' => 0.80, 'price_out' => 0.80, 'vision' => true],
+        // Ready in Yandex AI Studio; slug has no "-vl-" segment, so ModelCatalog::yandexSeesImages()
+        // (name-based heuristic, see T072) can't auto-detect it — hardcoded here as the default vision model.
+        ['id' => 'qwen3.6-35b-a3b', 'label' => 'Qwen3.6 35B A3B (зрение)', 'provider' => 'yandex', 'full_id' => 'qwen3.6-35b-a3b', 'group' => 'Yandex AI Studio · зрение', 'price_in' => 0.35, 'price_out' => 0.35, 'vision' => true],
         ['id' => 'deepseek-vl2',      'label' => 'DeepSeek VL 2 (зрение)',      'provider' => 'yandex', 'full_id' => 'deepseek-vl2',      'group' => 'Yandex AI Studio · зрение', 'price_in' => 0.50, 'price_out' => 0.50, 'vision' => true],
         ['id' => 'deepseek-vl2-tiny', 'label' => 'DeepSeek VL 2 Tiny (зрение)', 'provider' => 'yandex', 'full_id' => 'deepseek-vl2-tiny', 'group' => 'Yandex AI Studio · зрение', 'price_in' => 0.20, 'price_out' => 0.20, 'vision' => true],
         // ── Yandex Vision OCR (PDF text recognition, not a chat model) ──

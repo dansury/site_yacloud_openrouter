@@ -69,6 +69,7 @@
 | `setup.php`          | `/spec/settings.md` |
 | `auto_pull.php`      | `/spec/auto_pull.md` |
 | `example.php`        | `/spec/llm.md` §6 (CLI smoke modes) |
+| `tests/llm_chain.php` | `/spec/llm.md` §4 (candidate chain, run: `php tests/llm_chain.php`) |
 
 ---
 
