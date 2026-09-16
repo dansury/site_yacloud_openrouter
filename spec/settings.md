@@ -44,7 +44,7 @@ Keys outside the whitelist are ENV/code-only (e.g. `OPENROUTER_URL`, `LLM_TIMEOU
 | Fallback | `LLM_FALLBACK_MODE` (`auto` — a newer version of the same model first; `manual` — list only), `LLM_FALLBACK_MODELS` (`` — comma-separated short ids, written by three dropdowns in `setup.php`) |
 | Model catalogue | `MODEL_CATALOG_MODELS` (``), `MODEL_CATALOG_SYNCED_AT` (``), `MODEL_CATALOG_ERROR` (``), `MODEL_CATALOG_TTL_MIN` (15) — see `/spec/model_catalog.md` |
 | OpenRouter | `OPENROUTER_API_KEY` (``), `OPENROUTER_URL` (chat/completions), `LLM_FALLBACK_MODEL` (`openrouter/auto`), `LLM_OCR_MODELS` (array, comma-split from ENV) |
-| Vision | `LLM_VISION_MODEL` (`google/gemini-2.0-flash-001`) — the model for photos, labels and PDF pages. Accepts `"<provider>:<slug>"`, a short id, or a bare slug (bare = OpenRouter), so a Yandex multimodal model can be chosen here too (`/spec/llm.md` §2) |
+| Vision | `LLM_VISION_MODEL` (`yandex:qwen3.6-35b-a3b`) — the model for photos, labels and PDF pages. Accepts `"<provider>:<slug>"`, a short id, or a bare slug (bare = OpenRouter), so a Yandex multimodal model can be chosen here too (`/spec/llm.md` §2) |
 | Yandex Cloud | `YANDEX_API_KEY`, `YANDEX_FOLDER_ID`, `YANDEX_LLM_URL` (OpenAI-compatible), `YANDEX_OCR_URL` (`…/ocr/v1/recognizeText`), `YANDEX_OCR_MODEL` (`page`), `YANDEX_OCR_ENABLED` (`1`), `YANDEX_FALLBACK_MODEL` (`deepseek-r1`) |
 | Timeouts | `LLM_TIMEOUT_SEC` (120), `LLM_MAX_RETRIES` (2) |
 | Admin gate | `ADMIN_PASSWORD` (``) |
@@ -67,9 +67,15 @@ Adding a model = adding a row.
 
 The hardcoded Yandex rows are the slugs Yandex AI Studio actually serves (first-party
 `yandexgpt*`, open catalogue `llama-3.3-70b-instruct`, `phi-4`, and the multimodal
-`gemma-3-{4b,12b,27b}-it`, `qwen2.5-vl-72b-instruct`, `deepseek-vl2{,-tiny}`); an invented
+`gemma-3-{4b,12b,27b}-it`, `qwen2.5-vl-72b-instruct`, `qwen3.6-35b-a3b`,
+`deepseek-vl2{,-tiny}`); an invented
 slug answers `Failed to get model` at call time, so rows are added only for models the
 provider's own catalogue lists.
+
+`qwen3.6-35b-a3b` — the default `LLM_VISION_MODEL` — is hardcoded with `vision => true`
+for a second reason: its slug carries no `-vl-` segment, so the name heuristic that flags
+Yandex live rows as multimodal (`/spec/model_catalog.md` §4) cannot name it, and without
+the hardcoded row a photo step would drop it as image-blind.
 
 **Live rows.** At the end of `config.php` the cached provider catalogue is merged in
 (`ModelCatalog::decode()` + `merge()`, no network — see `/spec/model_catalog.md`). A live

@@ -24,6 +24,41 @@
 
 require_once __DIR__ . '/model_catalog.php';   // model versions for the auto fallback
 
+/**
+ * A provider answered with an HTTP error. Carries the status and the raw body
+ * next to the message, so the chain can tell WHAT failed apart: one dead model
+ * («Failed to get model») lets the chain go on, a rejected key or a gateway
+ * standing between us and the provider makes every further candidate of that
+ * provider a waste of a second.
+ */
+final class LLMHttpError extends RuntimeException {
+    public $provider;
+    public $status;
+    public $body;
+
+    public function __construct(string $message, string $provider, int $status, string $body) {
+        parent::__construct($message);
+        $this->provider = $provider;
+        $this->status = $status;
+        $this->body = $body;
+    }
+
+    /**
+     * Why this is not about the model asked for — NULL when it is. A provider
+     * reports a model problem in its own error envelope ({"error":{...}}); a
+     * bare string or a non-JSON page under 401/403 comes from something in
+     * front of it (hosting WAF, proxy), and the key being refused is not about
+     * the model either.
+     */
+    public function providerWide(): ?string {
+        if ($this->status === 401 || $this->status === 407) return 'ключ провайдера отклонён';
+        if ($this->status !== 403) return null;
+        $j = json_decode($this->body, true);
+        if (is_array($j) && isset($j['error']) && is_array($j['error'])) return null;   // provider's own 403
+        return 'запрос к провайдеру заблокирован на подступах (хостинг или прокси)';
+    }
+}
+
 final class LLM {
     private static ?array $cfg = null;
     private static $store = null;                      // optional logger
@@ -47,6 +82,50 @@ final class LLM {
             $out[] = sprintf('#%d %s → %s', $i + 1, $t['candidate'], $t['result']);
         }
         return implode(' | ', $out);
+    }
+
+    /**
+     * One sentence for the person waiting on the answer — the numbered chain of
+     * the exception belongs in the admin log, not on a phone screen. Attempts
+     * are grouped by provider and reduced to a cause, so ten «Failed to get
+     * model» read as «yandex: модели не включены в каталоге облака».
+     * Empty string when the last dispatch did not fail. $trace is the last
+     * dispatch's unless one is passed in.
+     */
+    public static function failureReason(?array $trace = null): string {
+        $causes = [];
+        foreach ($trace ?? self::$trace as $t) {
+            $result = (string) ($t['result'] ?? '');
+            if ($result === '' || strpos($result, 'ok (') === 0) continue;
+            $provider = strtolower(explode(':', (string) ($t['candidate'] ?? '?'))[0]);
+            $cause = self::causeOf($result);
+            if ($cause === null) continue;
+            $causes[$provider][$cause] = true;
+        }
+        $parts = [];
+        foreach ($causes as $provider => $set) {
+            $parts[] = $provider . ': ' . implode(', ', array_keys($set));
+        }
+        return $parts ? implode('; ', $parts) : '';
+    }
+
+    /** One provider answer → the cause behind it. NULL for a skip line: a model
+     *  we chose not to ask is not a reason the request failed. */
+    private static function causeOf(string $result): ?string {
+        $r = mb_strtolower($result);
+        if (strpos($r, 'пропущен:') === 0)                     return null;
+        if (strpos($r, 'failed to get model') !== false)       return 'модель не включена в каталоге облака';
+        if (strpos($r, 'access denied by security policy') !== false) return 'запрос блокирует хостинг';
+        if (strpos($r, 'http 401') !== false)                  return 'ключ не принят';
+        if (strpos($r, 'http 403') !== false)                  return 'доступ к модели запрещён';
+        if (strpos($r, 'http 429') !== false)                  return 'превышен лимит запросов';
+        if (strpos($r, 'text is empty') !== false
+            || strpos($r, 'empty message text') !== false)     return 'модель не приняла изображение';
+        if (strpos($r, 'not configured') !== false)            return 'провайдер не настроен';
+        if (strpos($r, 'timed out') !== false
+            || strpos($r, 'timeout') !== false)                return 'провайдер не ответил вовремя';
+        if (strpos($r, 'http 5') !== false)                    return 'провайдер отвечает ошибкой';
+        return 'провайдер отказал';
     }
 
     public static function cfg(): array {
@@ -183,14 +262,14 @@ final class LLM {
         return $out;
     }
 
-    /** Is this provider+slug present in the catalogue? Used to drop a blind
-     *  per-provider fallback (YANDEX_FALLBACK_MODEL) that the cloud folder does
-     *  not actually serve — that is what answers «Failed to get model». */
-    private static function slugInCatalogue(string $provider, string $slug): bool {
+    /** The catalogue row for provider+slug, live one first. A hardcoded row and
+     *  a live one share the slug after ModelCatalog::merge(), so this returns
+     *  whatever the merge produced — carrying its `live` and `vision` flags. */
+    private static function catalogueRow(string $provider, string $slug): ?array {
         foreach ((array) (self::cfg()['AVAILABLE_MODELS'] ?? []) as $row) {
-            if (($row['provider'] ?? '') === $provider && (string) ($row['full_id'] ?? '') === $slug) return true;
+            if (($row['provider'] ?? '') === $provider && (string) ($row['full_id'] ?? '') === $slug) return $row;
         }
-        return false;
+        return null;
     }
 
     /** Does the catalogue know ANY live (provider-confirmed) row for a provider?
@@ -200,6 +279,21 @@ final class LLM {
             if (($row['provider'] ?? '') === $provider && !empty($row['live'])) return true;
         }
         return false;
+    }
+
+    /**
+     * A model the provider answered its catalogue for and did not list — the
+     * same verdict the admin page draws with ⛔ (`web/lib/model_hints.php`
+     * model_unconfirmed). Asking it costs a round trip and comes back «Failed
+     * to get model», burying the reason the chain got that far. The hardcoded
+     * AVAILABLE_MODELS list does NOT vouch for a slug: it ages with the release,
+     * the live answer does not. A provider whose catalogue never arrived proves
+     * nothing — its rows stay usable.
+     */
+    private static function rowIsDead(array $row): bool {
+        $provider = (string) ($row['provider'] ?? '');
+        if ($provider === '' || !self::hasLiveRows($provider)) return false;
+        return empty($row['live']);
     }
 
     /** Resolve the active model for the current request, honoring provider override. */
@@ -606,6 +700,88 @@ final class LLM {
     }
 
     /**
+     * Who gets asked, in order, and who does not — pure over the config, no
+     * network: the admin page and the tests read the same chain the dispatch
+     * walks. Returns ['primary'=>row, 'candidates'=>[row…], 'skipped'=>[trace…]].
+     *
+     * Order: the chosen model, then (LLM_FALLBACK_MODE=auto) newer versions of
+     * it, the operator's LLM_FALLBACK_MODELS, the vision pool on a photo step,
+     * and last each provider's per-provider fallback in LLM_PROVIDER_PRIORITY
+     * order.
+     *
+     * Dropped along the way, each with a reason in `skipped`:
+     *   - a model its own provider did not list in the live catalogue
+     *     (rowIsDead) — every such request answers «Failed to get model»;
+     *   - on a photo step, a model that does not take images — a text model
+     *     answers a photo with «text is empty», which reads like our bug;
+     *   - a provider without a key.
+     * The CHOSEN model is never dropped: it is an explicit decision and the
+     * admin page already marks it ⛔ when the catalogue disagrees.
+     */
+    public static function candidateChain(bool $vision): array {
+        $cfg = self::cfg();
+        $primary = $vision ? (self::visionModelRow() ?? self::activeModel()) : self::activeModel();
+        $primaryProvider = $primary['provider'] ?? 'openrouter';
+        $candidates = [$primary];
+        $skipped = [];
+        $hasOR = !empty($cfg['OPENROUTER_API_KEY']);
+        $hasYA = !empty($cfg['YANDEX_API_KEY']) && !empty($cfg['YANDEX_FOLDER_ID']);
+        $drop = static function (array $row, string $why) use (&$skipped): void {
+            $skipped[] = [
+                'candidate' => ($row['provider'] ?? '?') . ':' . ($row['full_id'] ?? '?'),
+                'result'    => 'пропущен: ' . $why,
+            ];
+        };
+
+        $named = self::fallbackMode() === 'auto'
+            ? array_merge(self::autoFallbackRows($primary['id'] ?? null), self::configuredFallbackRows())
+            : self::configuredFallbackRows();
+        if ($vision) $named = array_merge($named, self::visionModelRows());
+        foreach ($named as $row) {
+            $prov = $row['provider'] ?? 'openrouter';
+            if ($prov === 'openrouter' && !$hasOR) continue;
+            if ($prov === 'yandex' && !$hasYA) continue;
+            // A slug never travels to the other provider: the row keeps its own.
+            if (($row['full_id'] ?? '') === ($primary['full_id'] ?? '') && $prov === $primaryProvider) continue;
+            if ($vision && !self::rowIsVision($row)) { $drop($row, 'модель не принимает изображения'); continue; }
+            if (self::rowIsDead($row)) { $drop($row, 'провайдер не назвал эту модель в своём каталоге'); continue; }
+            $candidates[] = $row;
+        }
+
+        $fallbackModels = [
+            'openrouter' => (string) ($cfg['LLM_FALLBACK_MODEL'] ?? 'openrouter/auto'),
+            'yandex'     => (string) ($cfg['YANDEX_FALLBACK_MODEL'] ?? 'deepseek-r1'),
+        ];
+        foreach (self::providerPriority() as $prov) {
+            if ($prov === 'openrouter' && !$hasOR) continue;
+            if ($prov === 'yandex' && !$hasYA) continue;
+            $fbModel = $fallbackModels[$prov] ?? '';
+            if ($fbModel === '') continue;
+            if ($prov === $primaryProvider && $fbModel === (string) ($primary['full_id'] ?? '')) continue;
+            // Resolved through the catalogue, not sent blind: the row that comes
+            // back carries the `vision` and `live` flags the two filters below
+            // need. Nothing there — the slug travels as the operator wrote it.
+            $row = self::catalogueRow($prov, $fbModel) ?? [
+                'provider' => $prov, 'full_id' => $fbModel,
+                'id' => 'fallback_' . $prov, 'label' => 'fallback_' . $prov,
+            ];
+            if (self::rowIsDead($row)) { $drop($row, 'провайдер не назвал эту модель в своём каталоге'); continue; }
+            if ($vision && !self::rowIsVision($row)) { $drop($row, 'модель не принимает изображения'); continue; }
+            $candidates[] = $row;
+        }
+
+        // One attempt per provider+slug pair, in the order built above.
+        $seen = [];
+        $candidates = array_values(array_filter($candidates, static function (array $row) use (&$seen) {
+            $key = ($row['provider'] ?? '?') . '|' . ($row['full_id'] ?? '?');
+            if (isset($seen[$key])) return false;
+            $seen[$key] = true;
+            return true;
+        }));
+        return ['primary' => $primary, 'candidates' => $candidates, 'skipped' => $skipped];
+    }
+
+    /**
      * Run one logical step across the candidate chain until a model answers.
      *
      * $vision — the request carries images: the chain starts at LLM_VISION_MODEL
@@ -618,66 +794,24 @@ final class LLM {
      * as a Yandex problem.
      */
     private static function dispatch(string $step, array $messages, ?int $sessionId, float $temp, bool $json, bool $vision = false): string {
-        $cfg = self::cfg();
-        $primary = $vision ? (self::visionModelRow() ?? self::activeModel()) : self::activeModel();
+        $chain = self::candidateChain($vision);
+        $primary = $chain['primary'];
         $primaryProvider = $primary['provider'] ?? 'openrouter';
-        // Fallback order: the chosen model, then (in auto mode) newer versions
-        // of the same model, then the operator's LLM_FALLBACK_MODELS, and only
-        // then each provider's per-provider fallback model.
-        $candidates = [$primary];
-        $hasOR = !empty($cfg['OPENROUTER_API_KEY']);
-        $hasYA = !empty($cfg['YANDEX_API_KEY']) && !empty($cfg['YANDEX_FOLDER_ID']);
-        $named = self::fallbackMode() === 'auto'
-            ? array_merge(self::autoFallbackRows($primary['id'] ?? null), self::configuredFallbackRows())
-            : self::configuredFallbackRows();
-        if ($vision) $named = array_merge($named, self::visionModelRows());
-        foreach ($named as $row) {
-            $prov = $row['provider'] ?? 'openrouter';
-            if ($prov === 'openrouter' && !$hasOR) continue;
-            if ($prov === 'yandex' && !$hasYA) continue;
-            if ($vision && !self::rowIsVision($row)) continue;
-            // A slug never travels to the other provider: the row keeps its own.
-            if (($row['full_id'] ?? '') === ($primary['full_id'] ?? '') && $prov === $primaryProvider) continue;
-            $candidates[] = $row;
-        }
-        $fallbackModels = [
-            'openrouter' => (string) ($cfg['LLM_FALLBACK_MODEL'] ?? 'openrouter/auto'),
-            'yandex'     => (string) ($cfg['YANDEX_FALLBACK_MODEL'] ?? 'deepseek-r1'),
-        ];
-        foreach (self::providerPriority() as $prov) {
-            if ($prov === 'openrouter' && !$hasOR) continue;
-            if ($prov === 'yandex' && !$hasYA) continue;
-            $fbModel = $fallbackModels[$prov] ?? '';
-            if ($fbModel === '') continue;
-            if ($prov === $primaryProvider && $fbModel === (string) ($primary['full_id'] ?? '')) continue;
-            // A blind per-provider fallback that the live catalogue does not
-            // list is skipped: sending it only yields «Failed to get model»
-            // and hides the real reason the chain got this far.
-            if (self::hasLiveRows($prov) && !self::slugInCatalogue($prov, $fbModel)) {
-                self::$trace[] = [
-                    'candidate' => $prov . ':' . $fbModel,
-                    'result'    => 'пропущен: модели нет в каталоге провайдера',
-                ];
-                continue;
-            }
-            $row = ['provider' => $prov, 'full_id' => $fbModel, 'id' => 'fallback_' . $prov, 'label' => 'fallback_' . $prov];
-            if ($vision && !self::rowIsVision($row)) continue;
-            $candidates[] = $row;
-        }
-        // One attempt per provider+slug pair, in the order built above.
-        $seen = [];
-        $candidates = array_values(array_filter($candidates, static function (array $row) use (&$seen) {
-            $key = ($row['provider'] ?? '?') . '|' . ($row['full_id'] ?? '?');
-            if (isset($seen[$key])) return false;
-            $seen[$key] = true;
-            return true;
-        }));
-        self::$trace = [];
+        $candidates = $chain['candidates'];
+        self::$trace = $chain['skipped'];
         $lastError = null;
         $failures = [];
+        // A provider that refused the key, or that something in front of it
+        // refuses for us, refuses the rest of its models the same way. Asking
+        // them anyway spends a second each and buries the real reason.
+        $blocked = [];
         foreach ($candidates as $idx => $row) {
             $t0 = microtime(true);
             $tag = $row['provider'] . ':' . $row['full_id'];
+            if (isset($blocked[$row['provider']])) {
+                self::$trace[] = ['candidate' => $tag, 'result' => 'пропущен: ' . $blocked[$row['provider']]];
+                continue;
+            }
             try {
                 $resp = self::http($row, $messages, $temp, $json);
                 $latency = (int) ((microtime(true) - $t0) * 1000);
@@ -708,12 +842,16 @@ final class LLM {
                 $failures[] = $tag . ' → ' . $lastError;
                 self::$trace[] = ['candidate' => $tag, 'result' => $lastError, 'latency_ms' => $latency];
                 self::logCall($sessionId, $step, $tag, $latency, 'exception', $lastError, null);
+                if ($e instanceof LLMHttpError) {
+                    $why = $e->providerWide();
+                    if ($why !== null) $blocked[$e->provider] = $why;
+                }
             }
         }
         // The whole chain, numbered — the message an operator can act on.
-        $chain = [];
-        foreach ($failures as $n => $line) $chain[] = '[' . ($n + 1) . '] ' . $line;
-        $detail = $chain ? implode('; ', $chain) : 'ни одного кандидата: проверьте ключи провайдеров';
+        $numbered = [];
+        foreach ($failures as $n => $line) $numbered[] = '[' . ($n + 1) . '] ' . $line;
+        $detail = $numbered ? implode('; ', $numbered) : 'ни одного кандидата: проверьте ключи провайдеров';
         $msg = "LLM $step failed (" . count($failures) . ' попыток): ' . $detail;
         self::diag('error', 'Все кандидаты отказали на шаге «' . $step . '»', [
             'step'       => $step,
@@ -865,15 +1003,20 @@ final class LLM {
             // no secret — the folder id is not one), and the answer body.
             // «YANDEX HTTP 400: Failed to get model» on its own says nothing
             // about WHICH model was asked for.
-            throw new RuntimeException(sprintf(
-                '%s HTTP %s @ %s model=%s%s: %s',
-                strtoupper((string) $provider),
-                (string) $code,
-                (string) $url,
-                (string) $modelStr,
-                $jsonMode ? ' json_object' : '',
-                $err ?: substr((string) $out, 0, 400)
-            ));
+            throw new LLMHttpError(
+                sprintf(
+                    '%s HTTP %s @ %s model=%s%s: %s',
+                    strtoupper((string) $provider),
+                    (string) $code,
+                    (string) $url,
+                    (string) $modelStr,
+                    $jsonMode ? ' json_object' : '',
+                    $err ?: substr((string) $out, 0, 400)
+                ),
+                (string) $provider,
+                (int) $code,
+                $out === false ? '' : substr((string) $out, 0, 2000)
+            );
         }
         $data = json_decode((string) $out, true);
         return is_array($data) ? $data : null;
