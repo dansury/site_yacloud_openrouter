@@ -32,7 +32,8 @@ if (!function_exists('cfg_settings_whitelist')) {
             'MODEL_CATALOG_MODELS', 'MODEL_CATALOG_SYNCED_AT', 'MODEL_CATALOG_ERROR',
             'MODEL_CATALOG_TTL_MIN',
             'LLM_OCR_MODELS', 'YANDEX_FALLBACK_MODEL',
-            'YANDEX_API_KEY', 'YANDEX_FOLDER_ID', 'YANDEX_LLM_URL', 'YANDEX_MODELS_URL',
+            'YANDEX_API_KEY', 'YANDEX_FOLDER_ID', 'YANDEX_LLM_URL', 'YANDEX_LLM_URL_FM',
+            'YANDEX_MODELS_URL', 'LLM_MAX_TOKENS',
             'YANDEX_OCR_URL', 'YANDEX_OCR_MODEL', 'YANDEX_OCR_ENABLED',
             'ADMIN_EMAIL', 'ERROR_EMAIL',
             'SMTP_HOST', 'SMTP_PORT', 'SMTP_USER', 'SMTP_PASS', 'SMTP_FROM', 'SMTP_FROM_NAME',
@@ -83,6 +84,10 @@ $config = [
     'YANDEX_API_KEY'        => cfg_env('YANDEX_API_KEY', ''),
     'YANDEX_FOLDER_ID'      => cfg_env('YANDEX_FOLDER_ID', ''),
     'YANDEX_LLM_URL'        => cfg_env('YANDEX_LLM_URL', 'https://llm.api.cloud.yandex.net/v1/chat/completions'),
+    // The second Yandex address. Not every model of the folder is on both: the
+    // YandexGPT family answers here, the open ones on the OpenAI-compatible URL
+    // above. Which slug needs which is asked, not assumed (spec/llm.md §5.1).
+    'YANDEX_LLM_URL_FM'     => cfg_env('YANDEX_LLM_URL_FM', 'https://llm.api.cloud.yandex.net/foundationModels/v1/completion'),
     // Models API: the folder's real model list (GET, folderId in the query). The
     // OpenAI-compatible /v1/models is the fallback when this one is unavailable.
     'YANDEX_MODELS_URL'     => cfg_env('YANDEX_MODELS_URL', 'https://llm.api.cloud.yandex.net/foundationModels/v1/models'),
@@ -92,6 +97,10 @@ $config = [
     // '1' → Yandex Vision OCR participates in the PDF-OCR chain. Needs key + folder.
     'YANDEX_OCR_ENABLED'    => cfg_env('YANDEX_OCR_ENABLED', '1'),
 
+    // Answer length ceiling. 0 — the provider's own limit, nothing is sent, so
+    // nothing that fits today starts being cut off. Above zero it travels as
+    // `max_tokens` / `completionOptions.maxTokens`.
+    'LLM_MAX_TOKENS'        => (int) cfg_env('LLM_MAX_TOKENS', '0'),
     'LLM_TIMEOUT_SEC'       => (int) cfg_env('LLM_TIMEOUT_SEC', '120'),
     'LLM_MAX_RETRIES'       => (int) cfg_env('LLM_MAX_RETRIES', '2'),
 
@@ -175,7 +184,7 @@ $config = [
     $dbPath = $config['DB_PATH'];
     if (!is_string($dbPath) || !file_exists($dbPath)) return;
     $overlayKeys = cfg_settings_whitelist();
-    $intKeys = ['SMTP_PORT', 'AUTOPULL_INTERVAL'];
+    $intKeys = ['SMTP_PORT', 'AUTOPULL_INTERVAL', 'LLM_MAX_TOKENS'];
     $csvKeys = ['LLM_OCR_MODELS']; // stored comma-separated, consumed as array
     try {
         $pdo = new PDO('sqlite:' . $dbPath);

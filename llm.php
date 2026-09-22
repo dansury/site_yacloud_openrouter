@@ -66,6 +66,14 @@ final class LLM {
     private static ?string $providerOverride = null;   // 'openrouter' | 'yandex' | null
     /** Per-candidate outcome of the last dispatch() — what the admin log shows. */
     private static array $trace = [];
+    /** Yandex address each slug is known to answer on: slug => 'openai'|'fm' (§5.1). */
+    private static array $yandexRoutes = [];
+    /** An address that already answered this request — a 400 after it is about the model. */
+    private static array $yandexRouteWorked = [];
+    /** The one blind re-ask at the other address allowed per request. */
+    private static bool $yandexCrossTried = false;
+    /** How the provider ended the last answer: 'length' / '…TRUNCATED…' = cut off. */
+    private static string $lastFinish = '';
 
     public static function init(array $cfg, $store = null): void {
         self::$cfg = $cfg;
@@ -115,6 +123,8 @@ final class LLM {
         $r = mb_strtolower($result);
         if (strpos($r, 'пропущен:') === 0)                     return null;
         if (strpos($r, 'failed to get model') !== false)       return 'модель не включена в каталоге облака';
+        if (strpos($r, 'via grpc') !== false
+            || strpos($r, 'openai api instead') !== false)     return 'модель отвечает только по OpenAI-совместимому адресу';
         if (strpos($r, 'access denied by security policy') !== false) return 'запрос блокирует хостинг';
         if (strpos($r, 'http 401') !== false)                  return 'ключ не принят';
         if (strpos($r, 'http 403') !== false)                  return 'доступ к модели запрещён';
@@ -562,6 +572,12 @@ final class LLM {
                 continue;
             }
             $data = json_decode((string) $body, true);
+            // The parallel path builds its request the same way as the sequential
+            // one, so a model routed to Foundation Models answers in that shape
+            if (is_array($data) && ($primary['provider'] ?? '') === 'yandex'
+                && self::yandexRoute((string) ($primary['full_id'] ?? '')) === 'fm') {
+                $data = self::normalizeYandexFm($data);
+            }
             $content = is_array($data) ? self::extractContent($data) : null;
             if (!is_string($content) || trim($content) === '') {
                 self::logCall($sessionId, $spec['step'], $tag, $latency, 'multi_no_content', null, (string) $body);
@@ -599,28 +615,150 @@ final class LLM {
         return 'gpt://' . $folder . '/' . $fullId;
     }
 
-    /** Build a configured cURL handle for the active provider/model (no curl_exec). */
-    private static function buildCurl(array $modelRow, array $messages, float $temp, bool $jsonMode, array $extra) {
+    /* ──────────── Yandex: which of the two addresses answers ──────────── */
+
+    /**
+     * The address this slug is known to answer on: `openai` (the configured
+     * YANDEX_LLM_URL) or `fm` (the Foundation Models one). Nothing learned yet
+     * means the configured address — it is right for most of the catalogue.
+     */
+    public static function yandexRoute(string $slug): string {
+        $slug = trim($slug, " /");
+        return ((self::$yandexRoutes[$slug] ?? '') === 'fm') ? 'fm' : 'openai';
+    }
+
+    /** Remember the address that answered, for the rest of this request. */
+    private static function noteYandexRoute(string $slug, string $route): void {
+        self::$yandexRoutes[trim($slug, " /")] = $route === 'fm' ? 'fm' : 'openai';
+    }
+
+    /**
+     * The address the provider's own refusal names, or NULL when it names none.
+     * «Model is not available via gRPC API. Please use HTTP OpenAI API instead»
+     * is Yandex telling us the model lives on the other endpoint, not that the
+     * model is missing.
+     */
+    public static function yandexRouteHint(string $error): ?string {
+        // Only prose counts: the message also carries the URL the call went to,
+        // and `…/foundationModels/v1/completion` inside it names nothing
+        $e = mb_strtolower($error);
+        if (strpos($e, 'via grpc') !== false || strpos($e, 'openai api instead') !== false) return 'openai';
+        if (strpos($e, 'foundation models api') !== false) return 'fm';
+        return null;
+    }
+
+    private static function otherRoute(string $route): string {
+        return $route === 'fm' ? 'openai' : 'fm';
+    }
+
+    /**
+     * How a candidate is named in the trace and the log. A Yandex model that
+     * answers on the Foundation Models address carries it: `yandex:gemma@fm`
+     * — otherwise the operator reads «the model failed» where the address was
+     * the whole story.
+     */
+    private static function tagFor(array $row): string {
+        $tag = ($row['provider'] ?? '?') . ':' . ($row['full_id'] ?? '?');
+        if (($row['provider'] ?? '') === 'yandex' && self::yandexRoute((string) ($row['full_id'] ?? '')) === 'fm') {
+            $tag .= '@fm';
+        }
+        return $tag;
+    }
+
+    /** Answer length ceiling; 0 — the provider's own default, nothing is sent. */
+    private static function maxTokens(): int {
+        return max(0, (int) (self::cfg()['LLM_MAX_TOKENS'] ?? 0));
+    }
+
+    /**
+     * The Foundation Models request. Same folder, same key, another shape:
+     * the model is a `gpt://` URI, the options live in `completionOptions`, and
+     * a message carries `text` instead of `content`.
+     */
+    public static function yandexFmBody(array $modelRow, array $messages, float $temp, bool $jsonMode): array {
+        $cfg = self::cfg();
+        $options = ['stream' => false, 'temperature' => $temp];
+        $max = self::maxTokens();
+        if ($max > 0) $options['maxTokens'] = $max;
+        if ($jsonMode) $options['responseFormat'] = ['type' => 'json_object'];
+
+        $turns = [];
+        foreach ($messages as $m) {
+            $turns[] = [
+                'role' => (string) ($m['role'] ?? 'user'),
+                'text' => is_string($m['content'] ?? null) ? (string) $m['content'] : '',
+            ];
+        }
+        return [
+            'modelUri' => self::yandexModelUri((string) ($cfg['YANDEX_FOLDER_ID'] ?? ''), (string) $modelRow['full_id']),
+            'completionOptions' => $options,
+            'messages' => $turns,
+        ];
+    }
+
+    /**
+     * Foundation Models answer → the OpenAI shape everything else reads.
+     * `alternatives[0].status` becomes `finish_reason`, so a truncated answer is
+     * recognised the same way on both addresses.
+     */
+    private static function normalizeYandexFm(array $data): array {
+        $alt = $data['result']['alternatives'][0] ?? null;
+        if (!is_array($alt)) return $data;
+        return [
+            'choices' => [[
+                'message' => ['role' => 'assistant', 'content' => (string) ($alt['message']['text'] ?? '')],
+                'finish_reason' => (string) ($alt['status'] ?? ''),
+            ]],
+            'usage' => $data['result']['usage'] ?? null,
+            'model' => $data['result']['modelVersion'] ?? null,
+        ];
+    }
+
+    /** A turn carrying images (or an $extra plugin key) has no Foundation Models form. */
+    private static function isPlainText(array $messages, array $extra): bool {
+        if ($extra) return false;
+        foreach ($messages as $m) {
+            if (!is_string($m['content'] ?? null)) return false;
+        }
+        return true;
+    }
+
+    /* ──────────── request building ──────────── */
+
+    /**
+     * URL, headers and body for one call — one place, so the parallel path
+     * (dispatchPair → buildCurl) and the sequential one (http) send the same
+     * request. `$route` only matters for Yandex (§5.1).
+     */
+    private static function requestFor(array $modelRow, array $messages, float $temp, bool $jsonMode,
+                                       array $extra = [], ?string $route = null): array {
         $cfg = self::cfg();
         $provider = $modelRow['provider'] ?? 'openrouter';
+
         if ($provider === 'yandex') {
-            $url = $cfg['YANDEX_LLM_URL'];
             $folder = $cfg['YANDEX_FOLDER_ID'] ?? '';
             if ($folder === '' || empty($cfg['YANDEX_API_KEY'])) {
                 throw new RuntimeException('Yandex LLM not configured (YANDEX_API_KEY / YANDEX_FOLDER_ID empty)');
             }
-            $modelStr = self::yandexModelUri($folder, (string) $modelRow['full_id']);
+            $route = $route ?: self::yandexRoute((string) $modelRow['full_id']);
             $headers = [
                 'Authorization: Api-Key ' . $cfg['YANDEX_API_KEY'],
                 'x-folder-id: ' . $folder,
                 'Content-Type: application/json',
             ];
+            $modelStr = self::yandexModelUri($folder, (string) $modelRow['full_id']);
+            if ($route === 'fm') {
+                $body = self::yandexFmBody($modelRow, $messages, $temp, $jsonMode);
+                return ['url' => (string) ($cfg['YANDEX_LLM_URL_FM'] ?? ''), 'headers' => $headers,
+                        'body' => $body, 'model' => $modelStr, 'route' => 'fm'];
+            }
+            $url = (string) $cfg['YANDEX_LLM_URL'];
         } else {
-            $url = $cfg['OPENROUTER_URL'];
+            $url = (string) $cfg['OPENROUTER_URL'];
             if (empty($cfg['OPENROUTER_API_KEY'])) {
                 throw new RuntimeException('OpenRouter not configured (OPENROUTER_API_KEY empty)');
             }
-            $modelStr = $modelRow['full_id'];
+            $modelStr = (string) $modelRow['full_id'];
             $headers = [
                 'Authorization: Bearer ' . $cfg['OPENROUTER_API_KEY'],
                 'Content-Type: application/json',
@@ -628,20 +766,74 @@ final class LLM {
                 'X-Title: ' . ($cfg['OPENROUTER_TITLE'] ?? 'site_yacloud_openrouter'),
             ];
         }
+
         $body = ['model' => $modelStr, 'messages' => $messages, 'temperature' => $temp];
         if ($jsonMode) $body['response_format'] = ['type' => 'json_object'];
+        $max = self::maxTokens();
+        if ($max > 0) $body['max_tokens'] = $max;
         foreach ($extra as $k => $v) $body[$k] = $v;
+        return ['url' => $url, 'headers' => $headers, 'body' => $body,
+                'model' => $modelStr, 'route' => $provider === 'yandex' ? 'openai' : ''];
+    }
 
-        $ch = curl_init($url);
+    /** Build a configured cURL handle for the active provider/model (no curl_exec). */
+    private static function buildCurl(array $modelRow, array $messages, float $temp, bool $jsonMode, array $extra) {
+        $cfg = self::cfg();
+        $req = self::requestFor($modelRow, $messages, $temp, $jsonMode, $extra);
+        $ch = curl_init($req['url']);
         curl_setopt_array($ch, [
             CURLOPT_POST => true,
-            CURLOPT_HTTPHEADER => $headers,
-            CURLOPT_POSTFIELDS => json_encode($body, JSON_UNESCAPED_UNICODE),
+            CURLOPT_HTTPHEADER => $req['headers'],
+            CURLOPT_POSTFIELDS => json_encode($req['body'], JSON_UNESCAPED_UNICODE),
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_TIMEOUT => $cfg['LLM_TIMEOUT_SEC'],
             CURLOPT_CONNECTTIMEOUT => 15,
         ]);
         return $ch;
+    }
+
+    /**
+     * Why the last answer did not parse — `json_last_error_msg()` plus the
+     * provider's own verdict when it stopped at the token limit. Captured right
+     * after parseJson(): any json_encode() further down resets the error.
+     */
+    private static function parseFailure(): string {
+        $why = json_last_error() === JSON_ERROR_NONE ? 'это не объект JSON' : json_last_error_msg();
+        if (self::lastTruncated()) $why .= ' (ответ оборвался по пределу длины)';
+        return $why;
+    }
+
+    /**
+     * The re-ask. Repeating the first request word for word brings back the same
+     * broken answer, so it says what was wrong with it — and, when the answer was
+     * cut off, asks for a shorter one instead of the same length again.
+     */
+    private static function jsonRetryTurn(string $why): string {
+        $turn = 'Предыдущий ответ не удалось разобрать: ' . $why . '. '
+              . 'Верни ровно один JSON-объект по указанной схеме: без markdown, без ограды ```, '
+              . 'без комментариев и текста до и после. Переводы строк внутри значений — \\n, '
+              . 'кавычки внутри строк — \\".';
+        if (self::lastTruncated()) {
+            $turn .= ' Ответ обязан уместиться целиком: пиши короче — только обязательные поля, '
+                   . 'без длинных описаний и повторов исходного текста.';
+        }
+        return $turn;
+    }
+
+    /** The exception an operator can act on: the reason, and where the limit lives. */
+    private static function jsonFailureMessage(string $step, string $why, string $raw): string {
+        $msg = "LLM step $step: invalid JSON after retry ($why)";
+        if (self::lastTruncated()) $msg .= '. Предел длины ответа — настройка LLM_MAX_TOKENS';
+        self::diag('error', 'Ответ модели не разобран как JSON на шаге «' . $step . '»: ' . $why, [
+            'step'      => $step,
+            'truncated' => self::lastTruncated(),
+            // The head shows a phrase before the object, the tail shows a cut-off
+            // mid-word: one end alone does not always tell what happened
+            'head'      => mb_substr($raw, 0, 400),
+            'tail'      => mb_substr($raw, -400),
+            'config'    => self::configSummary(),
+        ]);
+        return $msg;
     }
 
     private static function callJson(string $step, string $system, string $user, ?int $sessionId, float $temp): array {
@@ -653,13 +845,14 @@ final class LLM {
         $parsed = self::parseJson($raw);
         if ($parsed !== null) return $parsed;
 
+        $why = self::parseFailure();
         $retryMessages = $messages;
-        $retryMessages[] = ['role' => 'user', 'content' => 'Ответ не распознан как строгий JSON. Верни ровно один JSON-объект по указанной схеме. Без markdown, без комментариев.'];
+        $retryMessages[] = ['role' => 'user', 'content' => self::jsonRetryTurn($why)];
         $raw2 = self::dispatch($step . '_retry', $retryMessages, $sessionId, 0.0, true);
         $parsed = self::parseJson($raw2);
         if ($parsed !== null) return $parsed;
 
-        throw new RuntimeException("LLM step $step: invalid JSON after retry");
+        throw new RuntimeException(self::jsonFailureMessage($step, self::parseFailure(), $raw2));
     }
 
     /** [{type:text}, {type:image_url,image_url:{url}}, ...] — image_url first-class
@@ -682,13 +875,14 @@ final class LLM {
         $parsed = self::parseJson($raw);
         if ($parsed !== null) return $parsed;
 
+        $why = self::parseFailure();
         $retryMessages = $messages;
-        $retryMessages[] = ['role' => 'user', 'content' => 'Ответ не распознан как строгий JSON. Верни ровно один JSON-объект по указанной схеме. Без markdown, без комментариев.'];
+        $retryMessages[] = ['role' => 'user', 'content' => self::jsonRetryTurn($why)];
         $raw2 = self::dispatch($step . '_retry', $retryMessages, $sessionId, 0.0, true, true);
         $parsed = self::parseJson($raw2);
         if ($parsed !== null) return $parsed;
 
-        throw new RuntimeException("LLM step $step: invalid JSON after retry");
+        throw new RuntimeException(self::jsonFailureMessage($step, self::parseFailure(), $raw2));
     }
 
     private static function callText(string $step, string $system, string $user, ?int $sessionId, float $temp): string {
@@ -807,7 +1001,7 @@ final class LLM {
         $blocked = [];
         foreach ($candidates as $idx => $row) {
             $t0 = microtime(true);
-            $tag = $row['provider'] . ':' . $row['full_id'];
+            $tag = self::tagFor($row);
             if (isset($blocked[$row['provider']])) {
                 self::$trace[] = ['candidate' => $tag, 'result' => 'пропущен: ' . $blocked[$row['provider']]];
                 continue;
@@ -815,6 +1009,7 @@ final class LLM {
             try {
                 $resp = self::http($row, $messages, $temp, $json);
                 $latency = (int) ((microtime(true) - $t0) * 1000);
+                $tag = self::tagFor($row);   // the address is known only after the call
                 if ($resp === null) {
                     $lastError = 'empty response';
                     $failures[] = $tag . ' → ' . $lastError;
@@ -838,6 +1033,7 @@ final class LLM {
                 return $content;
             } catch (Throwable $e) {
                 $latency = (int) ((microtime(true) - $t0) * 1000);
+                $tag = self::tagFor($row);
                 $lastError = $e->getMessage();
                 $failures[] = $tag . ' → ' . $lastError;
                 self::$trace[] = ['candidate' => $tag, 'result' => $lastError, 'latency_ms' => $latency];
@@ -927,13 +1123,14 @@ final class LLM {
                 $content = is_array($resp) ? self::extractContent($resp) : null;
                 $ms = (int) ((microtime(true) - $t0) * 1000);
                 $ok = is_string($content) && trim($content) !== '';
+                $tag = self::tagFor($row);   // '@fm' when the other Yandex address answered
                 $out[] = [
                     'leg' => $label, 'model' => $tag, 'ok' => $ok,
                     'text' => $ok ? ('ответ получен за ' . $ms . ' мс') : 'ответ без содержимого: '
                         . mb_substr((string) json_encode($resp, JSON_UNESCAPED_UNICODE), 0, 300),
                 ];
             } catch (Throwable $e) {
-                $out[] = ['leg' => $label, 'model' => $tag, 'ok' => false, 'text' => $e->getMessage()];
+                $out[] = ['leg' => $label, 'model' => self::tagFor($row), 'ok' => false, 'text' => $e->getMessage()];
             }
         }
         foreach ($out as $r) {
@@ -950,45 +1147,61 @@ final class LLM {
     }
 
     /** $modelRow keys: provider, full_id. $extra is merged into the request body. */
+    /**
+     * One call to one model. For Yandex it also settles WHERE the model
+     * answers: a 400/404 at one address is re-asked once at the other one, and
+     * the address that answered is remembered for the rest of the request (§5.1).
+     */
     private static function http(array $modelRow, array $messages, float $temp, bool $jsonMode = false, array $extra = []): ?array {
+        $provider = $modelRow['provider'] ?? 'openrouter';
+        if ($provider !== 'yandex') return self::httpAt($modelRow, $messages, $temp, $jsonMode, $extra, null);
+
+        $slug = (string) $modelRow['full_id'];
+        $route = self::yandexRoute($slug);
+        try {
+            return self::httpAt($modelRow, $messages, $temp, $jsonMode, $extra, $route);
+        } catch (LLMHttpError $e) {
+            $other = self::otherRoute($route);
+            if (!self::mayCrossTry($e, $messages, $extra, $route, $other)) throw $e;
+            if (self::yandexRouteHint($e->getMessage()) === null) self::$yandexCrossTried = true;
+            self::diag('info', 'Yandex отказал по адресу ' . $route . ' — спрашиваем ту же модель по адресу '
+                             . $other, ['model' => $slug, 'error' => $e->getMessage()]);
+            $resp = self::httpAt($modelRow, $messages, $temp, $jsonMode, $extra, $other);
+            self::noteYandexRoute($slug, $other);
+            return $resp;
+        }
+    }
+
+    /**
+     * Is a second address worth a request? Only when the shape survives the move
+     * (no images, no plugin keys), the refusal is about this model (400/404),
+     * the other address is configured, and either the provider named it itself
+     * or nothing has proven the configured address right yet — at most once.
+     */
+    private static function mayCrossTry(LLMHttpError $e, array $messages, array $extra,
+                                        string $route, string $other): bool {
+        if (!self::isPlainText($messages, $extra)) return false;
+        if ($e->status !== 400 && $e->status !== 404) return false;
+        $cfg = self::cfg();
+        $otherUrl = $other === 'fm' ? (string) ($cfg['YANDEX_LLM_URL_FM'] ?? '') : (string) ($cfg['YANDEX_LLM_URL'] ?? '');
+        if (trim($otherUrl) === '') return false;
+        if (self::yandexRouteHint($e->getMessage()) === $other) return true;   // the provider said so
+        if (!empty(self::$yandexRouteWorked[$route])) return false;            // the address works, the model does not
+        return !self::$yandexCrossTried;                                       // one blind try per request
+    }
+
+    /** The request itself. $route — Yandex address, NULL for OpenRouter. */
+    private static function httpAt(array $modelRow, array $messages, float $temp, bool $jsonMode,
+                                   array $extra, ?string $route): ?array {
         $cfg = self::cfg();
         $provider = $modelRow['provider'] ?? 'openrouter';
+        $req = self::requestFor($modelRow, $messages, $temp, $jsonMode, $extra, $route);
 
-        if ($provider === 'yandex') {
-            $url = $cfg['YANDEX_LLM_URL'];
-            $folder = $cfg['YANDEX_FOLDER_ID'] ?? '';
-            if ($folder === '' || empty($cfg['YANDEX_API_KEY'])) {
-                throw new RuntimeException('Yandex LLM not configured (YANDEX_API_KEY / YANDEX_FOLDER_ID empty)');
-            }
-            $modelStr = self::yandexModelUri($folder, (string) $modelRow['full_id']);
-            $headers = [
-                'Authorization: Api-Key ' . $cfg['YANDEX_API_KEY'],
-                'x-folder-id: ' . $folder,
-                'Content-Type: application/json',
-            ];
-        } else {
-            $url = $cfg['OPENROUTER_URL'];
-            if (empty($cfg['OPENROUTER_API_KEY'])) {
-                throw new RuntimeException('OpenRouter not configured (OPENROUTER_API_KEY empty)');
-            }
-            $modelStr = $modelRow['full_id'];
-            $headers = [
-                'Authorization: Bearer ' . $cfg['OPENROUTER_API_KEY'],
-                'Content-Type: application/json',
-                'HTTP-Referer: ' . ($cfg['OPENROUTER_REFERER'] ?? 'https://example.com'),
-                'X-Title: ' . ($cfg['OPENROUTER_TITLE'] ?? 'site_yacloud_openrouter'),
-            ];
-        }
-
-        $body = ['model' => $modelStr, 'messages' => $messages, 'temperature' => $temp];
-        if ($jsonMode) $body['response_format'] = ['type' => 'json_object'];
-        foreach ($extra as $k => $v) $body[$k] = $v;
-
-        $ch = curl_init($url);
+        $ch = curl_init($req['url']);
         curl_setopt_array($ch, [
             CURLOPT_POST => true,
-            CURLOPT_HTTPHEADER => $headers,
-            CURLOPT_POSTFIELDS => json_encode($body, JSON_UNESCAPED_UNICODE),
+            CURLOPT_HTTPHEADER => $req['headers'],
+            CURLOPT_POSTFIELDS => json_encode($req['body'], JSON_UNESCAPED_UNICODE),
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_TIMEOUT => $cfg['LLM_TIMEOUT_SEC'],
             CURLOPT_CONNECTTIMEOUT => 15,
@@ -1008,8 +1221,8 @@ final class LLM {
                     '%s HTTP %s @ %s model=%s%s: %s',
                     strtoupper((string) $provider),
                     (string) $code,
-                    (string) $url,
-                    (string) $modelStr,
+                    (string) $req['url'],
+                    (string) $req['model'],
                     $jsonMode ? ' json_object' : '',
                     $err ?: substr((string) $out, 0, 400)
                 ),
@@ -1019,7 +1232,22 @@ final class LLM {
             );
         }
         $data = json_decode((string) $out, true);
-        return is_array($data) ? $data : null;
+        if (!is_array($data)) return null;
+        if (($req['route'] ?? '') === 'fm') $data = self::normalizeYandexFm($data);
+        if ($provider === 'yandex') self::$yandexRouteWorked[$req['route'] ?: 'openai'] = true;
+        self::$lastFinish = (string) ($data['choices'][0]['finish_reason'] ?? '');
+        return $data;
+    }
+
+    /**
+     * The provider stopped because the answer hit the length limit —
+     * `finish_reason: length` on the OpenAI shape, `…TRUNCATED_FINAL` on the
+     * Foundation Models one. A cut-off answer is never valid JSON, and asking
+     * again in the same words brings back the same stump (§5.2).
+     */
+    public static function lastTruncated(): bool {
+        $f = mb_strtolower(self::$lastFinish);
+        return $f === 'length' || $f === 'max_tokens' || strpos($f, 'truncated') !== false;
     }
 
     private static function extractContent(array $resp): ?string {
@@ -1035,19 +1263,143 @@ final class LLM {
         return null;
     }
 
-    private static function parseJson(string $raw): ?array {
-        $raw = trim($raw);
-        $raw = preg_replace('/^```(?:json)?\s*/i', '', $raw);
-        $raw = preg_replace('/\s*```$/', '', $raw);
-        $start = strpos($raw, '{');
-        $end = strrpos($raw, '}');
-        if ($start !== false && $end !== false && $end > $start) {
-            $candidate = substr($raw, $start, $end - $start + 1);
+    /**
+     * The model's answer as an array — or NULL when it really is not JSON.
+     *
+     * A model puts anything around its object: a ```json fence, a <think> aloud,
+     * «вот результат:» before the brace, «ёлочки» instead of straight quotes, a
+     * comma before the closing brace. Worse, the answer stops mid-word when it
+     * hits the token limit. Parsing goes from the cheapest attempt to the most
+     * patient one and stops at the first that yields an array. Nothing is
+     * invented: only brackets the model OPENED are closed.
+     *
+     * Public and pure — the test reads it without a network (spec §5).
+     */
+    public static function parseJson(string $raw): ?array {
+        // Broken bytes go first: any /u pattern returns null on them, and the
+        // whole answer used to be declared «not JSON» without being looked at
+        $raw = self::onlyUtf8($raw);
+        $raw = (string) preg_replace('/<think>.*?<\/think>/su', '', trim($raw));
+        $raw = (string) preg_replace('/```[a-z]*\s*/iu', '', $raw);
+        $raw = trim(str_replace('```', '', $raw));
+        if ($raw === '') return null;
+
+        $tries = [$raw];
+        // An object or an array inside a phrase — take the widest slice
+        if (preg_match('/[{\[].*[}\]]/su', $raw, $m)) $tries[] = $m[0];
+        // Cut off mid-value: close what the model opened
+        $repaired = self::repairJson($raw);
+        if ($repaired !== null) $tries[] = $repaired;
+
+        foreach ($tries as $candidate) {
             $parsed = json_decode($candidate, true);
             if (is_array($parsed)) return $parsed;
+            $clean = preg_replace('/,\s*([}\]])/u', '$1', $candidate);
+            $clean = strtr((string) $clean, ['“' => '"', '”' => '"', '„' => '"', '«' => '"', '»' => '"']);
+            $parsed = json_decode((string) $clean, true);
+            if (is_array($parsed)) return $parsed;
+            // A raw line break inside a value is the commonest way a model
+            // breaks its own JSON: escape what it left unescaped
+            $parsed = json_decode(self::escapeControls((string) $clean), true);
+            if (is_array($parsed)) return $parsed;
         }
-        $parsed = json_decode($raw, true);
-        return is_array($parsed) ? $parsed : null;
+        return null;
+    }
+
+    /** Bytes that are not valid UTF-8, dropped. */
+    private static function onlyUtf8(string $raw): string {
+        if ($raw === '' || mb_check_encoding($raw, 'UTF-8')) return $raw;
+        $out = @iconv('UTF-8', 'UTF-8//IGNORE', $raw);
+        return $out === false ? (string) mb_convert_encoding($raw, 'UTF-8', 'UTF-8') : $out;
+    }
+
+    /**
+     * A cut-off answer — close what is open and drop the tail.
+     *
+     * Exactly what a person does looking at truncated JSON: cut the unfinished
+     * value off and close the brackets in reverse order. The cut is at the last
+     * place where a value was COMPLETE, so a key without a value and a half-
+     * written string leave with the tail.
+     */
+    private static function repairJson(string $raw): ?string {
+        $start = strcspn($raw, '{[');
+        $len = strlen($raw);
+        if ($start >= $len) return null;
+        $raw = substr($raw, $start);
+        $len = strlen($raw);
+
+        $stack = [];
+        $best = null;                       // [position, stack copy] after a whole value
+        $i = 0;
+        while ($i < $len) {
+            $c = $raw[$i];
+            if ($c === '{' || $c === '[') { $stack[] = $c === '{' ? '}' : ']'; $i++; continue; }
+            if ($c === '}' || $c === ']') { array_pop($stack); $best = [++$i, $stack]; continue; }
+            if ($c === ',' || $c === ':' || ctype_space($c)) { $i++; continue; }
+            if ($c === '"') {
+                $j = self::endOfString($raw, $i);
+                if ($j === null) break;     // the string never closed — only rubbish follows
+                $i = $j;
+                // A string before a colon is a key, not a value: cutting there loses the pair
+                if (!self::nextIsColon($raw, $i)) $best = [$i, $stack];
+                continue;
+            }
+            // number, true, false, null
+            $j = $i;
+            while ($j < $len && strpos(",:{}[] \t\r\n", $raw[$j]) === false) $j++;
+            if ($j === $i) { $i++; continue; }
+            $i = $j;
+            $best = [$i, $stack];
+        }
+
+        if ($best === null || !$best[1]) return null;   // nothing to repair
+        return substr($raw, 0, $best[0]) . implode('', array_reverse($best[1]));
+    }
+
+    /** Index just past the closing quote of a string; NULL — never closed. */
+    private static function endOfString(string $raw, int $at): ?int {
+        $len = strlen($raw);
+        for ($i = $at + 1; $i < $len; $i++) {
+            if ($raw[$i] === '\\') { $i++; continue; }
+            if ($raw[$i] === '"') return $i + 1;
+        }
+        return null;
+    }
+
+    /** A colon follows this position — so what stood before it was a key. */
+    private static function nextIsColon(string $raw, int $from): bool {
+        $len = strlen($raw);
+        for ($i = $from; $i < $len; $i++) {
+            if (ctype_space($raw[$i])) continue;
+            return $raw[$i] === ':';
+        }
+        return false;
+    }
+
+    /**
+     * Raw control characters inside string literals — escaped, not dropped.
+     * JSON forbids a bare line break inside a string; a model writing a
+     * multi-line description puts one there anyway. Outside strings they are
+     * ordinary whitespace and stay as they are.
+     */
+    private static function escapeControls(string $json): string {
+        $out = '';
+        $inString = false;
+        $len = strlen($json);
+        for ($i = 0; $i < $len; $i++) {
+            $c = $json[$i];
+            if ($inString && $c === '\\' && $i + 1 < $len) { $out .= $c . $json[$i + 1]; $i++; continue; }
+            if ($c === '"') { $inString = !$inString; $out .= $c; continue; }
+            if ($inString && ord($c) < 0x20) {
+                if ($c === "\n")      $out .= '\\n';
+                elseif ($c === "\r")  $out .= '\\r';
+                elseif ($c === "\t")  $out .= '\\t';
+                else                   $out .= sprintf('\\u%04x', ord($c));
+                continue;
+            }
+            $out .= $c;
+        }
+        return $out;
     }
 
     /** {{token}} substitution helper for prompt templates. */

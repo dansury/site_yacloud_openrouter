@@ -28,6 +28,11 @@ no TZ citations. Specs live in [`spec.md`](spec.md) + `spec/`.
   (default, three backups, per-provider fallbacks, vision), never free text, and
   "Проверить модели и ключи" runs one real completion per leg so a wrong key or a model
   the cloud folder does not serve is named immediately.
+- **Two Yandex addresses, one model list** (`llm.php`) — not every model of a cloud folder
+  answers on both `v1/chat/completions` and `foundationModels/v1/completion`. A model
+  refused at one address is re-asked once at the other, the address that answered is
+  remembered for the rest of the request and shown in the trace (`yandex:gemma@fm`), so
+  «Model is not available via gRPC API» stops costing a candidate.
 - **Vision models of both providers** — `LLM_VISION_MODEL` accepts `"<provider>:<slug>"`,
   so photos, labels and page scans can go to a Yandex multimodal model
   (`qwen3.6-35b-a3b`, `gemma-3-{4b,12b,27b}-it`) as well as to OpenRouter.

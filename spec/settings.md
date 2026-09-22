@@ -29,7 +29,8 @@ and never breaks config loading.
 `LLM_VISION_MODEL`, `LLM_FALLBACK_MODEL`, `LLM_FALLBACK_MODE`, `LLM_FALLBACK_MODELS`,
 `MODEL_CATALOG_MODELS`, `MODEL_CATALOG_SYNCED_AT`, `MODEL_CATALOG_ERROR`,
 `MODEL_CATALOG_TTL_MIN`, `LLM_OCR_MODELS`, `YANDEX_FALLBACK_MODEL`,
-`YANDEX_API_KEY`, `YANDEX_FOLDER_ID`, `YANDEX_LLM_URL`, `YANDEX_MODELS_URL`, `YANDEX_OCR_URL`,
+`YANDEX_API_KEY`, `YANDEX_FOLDER_ID`, `YANDEX_LLM_URL`, `YANDEX_LLM_URL_FM`,
+`YANDEX_MODELS_URL`, `LLM_MAX_TOKENS`, `YANDEX_OCR_URL`,
 `YANDEX_OCR_MODEL`, `YANDEX_OCR_ENABLED`, `ADMIN_EMAIL`, `ERROR_EMAIL`, `SMTP_HOST`,
 `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM`, `SMTP_FROM_NAME`, `ADMIN_PASSWORD`.
 
@@ -45,7 +46,8 @@ Keys outside the whitelist are ENV/code-only (e.g. `OPENROUTER_URL`, `LLM_TIMEOU
 | Model catalogue | `MODEL_CATALOG_MODELS` (``), `MODEL_CATALOG_SYNCED_AT` (``), `MODEL_CATALOG_ERROR` (``), `MODEL_CATALOG_TTL_MIN` (15) — see `/spec/model_catalog.md` |
 | OpenRouter | `OPENROUTER_API_KEY` (``), `OPENROUTER_URL` (chat/completions), `LLM_FALLBACK_MODEL` (`openrouter/auto`), `LLM_OCR_MODELS` (array, comma-split from ENV) |
 | Vision | `LLM_VISION_MODEL` (`yandex:qwen3.6-35b-a3b`) — the model for photos, labels and PDF pages. Accepts `"<provider>:<slug>"`, a short id, or a bare slug (bare = OpenRouter), so a Yandex multimodal model can be chosen here too (`/spec/llm.md` §2) |
-| Yandex Cloud | `YANDEX_API_KEY`, `YANDEX_FOLDER_ID`, `YANDEX_LLM_URL` (OpenAI-compatible), `YANDEX_MODELS_URL` (`…/foundationModels/v1/models` — the Models API the catalogue refresh asks first), `YANDEX_OCR_URL` (`…/ocr/v1/recognizeText`), `YANDEX_OCR_MODEL` (`page`), `YANDEX_OCR_ENABLED` (`1`), `YANDEX_FALLBACK_MODEL` (`yandexgpt-5-lite`) |
+| Yandex Cloud | `YANDEX_API_KEY`, `YANDEX_FOLDER_ID`, `YANDEX_LLM_URL` (OpenAI-compatible), `YANDEX_LLM_URL_FM` (`…/foundationModels/v1/completion` — the second address, used for a model the first one does not serve, `/spec/llm.md` §5.1), `YANDEX_MODELS_URL` (`…/foundationModels/v1/models` — the Models API the catalogue refresh asks first), `YANDEX_OCR_URL` (`…/ocr/v1/recognizeText`), `YANDEX_OCR_MODEL` (`page`), `YANDEX_OCR_ENABLED` (`1`), `YANDEX_FALLBACK_MODEL` (`yandexgpt-5-lite`) |
+| Answer length | `LLM_MAX_TOKENS` (`0` — the provider's own limit; above zero it is sent as `max_tokens` / `completionOptions.maxTokens`, raised when the journal reports an answer cut off mid-value) |
 | Timeouts | `LLM_TIMEOUT_SEC` (120), `LLM_MAX_RETRIES` (2) |
 | Admin gate | `ADMIN_PASSWORD` (``) |
 | Mail | `ADMIN_EMAIL`, `ERROR_EMAIL`, `SMTP_HOST` (`smtp.yandex.ru`), `SMTP_PORT` (465), `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM` (← `SMTP_USER`), `SMTP_FROM_NAME` |
