@@ -151,8 +151,11 @@ final class DiagLog {
     /* ─────────────────────────── writing ─────────────────────────── */
 
     public static function write(string $level, string $channel, string $message, array $context = []): void {
-        if (self::$pdo === null) return;
         $level = in_array($level, self::LEVELS, true) ? $level : 'info';
+        // Report first: an error is worth forwarding even when the local log
+        // itself is unavailable (unwritable data/, locked database).
+        self::forward($level, $channel, $message, $context);
+        if (self::$pdo === null) return;
         try {
             $json = $context ? json_encode(self::redactArray($context), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES) : null;
             $stmt = self::$pdo->prepare(
@@ -167,6 +170,21 @@ final class DiagLog {
             ]);
             self::trim();
         } catch (Throwable $e) { /* logging must never break the caller */ }
+    }
+
+    /**
+     * Single bridge to the self-maintaining layer: an error already logged for
+     * the operator also becomes a report for the developer — but only when the
+     * layer is present AND booted AND the operator agreed (SelfHeal decides).
+     * DiagLog knows nothing about it beyond this call, and a missing or broken
+     * selfheal directory changes nothing here.
+     */
+    private static function forward(string $level, string $channel, string $message, array $context): void {
+        if ($level !== 'error') return;
+        if (!class_exists('Selfheal\SelfHeal', false)) return;   // not installed / not booted
+        try {
+            \Selfheal\SelfHeal::forward($level, $channel, $message, $context);
+        } catch (Throwable $e) { /* the bridge may never break logging */ }
     }
 
     public static function error(string $channel, string $message, array $context = []): void { self::write('error', $channel, $message, $context); }
