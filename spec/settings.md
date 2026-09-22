@@ -29,7 +29,7 @@ and never breaks config loading.
 `LLM_VISION_MODEL`, `LLM_FALLBACK_MODEL`, `LLM_FALLBACK_MODE`, `LLM_FALLBACK_MODELS`,
 `MODEL_CATALOG_MODELS`, `MODEL_CATALOG_SYNCED_AT`, `MODEL_CATALOG_ERROR`,
 `MODEL_CATALOG_TTL_MIN`, `LLM_OCR_MODELS`, `YANDEX_FALLBACK_MODEL`,
-`YANDEX_API_KEY`, `YANDEX_FOLDER_ID`, `YANDEX_LLM_URL`, `YANDEX_OCR_URL`,
+`YANDEX_API_KEY`, `YANDEX_FOLDER_ID`, `YANDEX_LLM_URL`, `YANDEX_MODELS_URL`, `YANDEX_OCR_URL`,
 `YANDEX_OCR_MODEL`, `YANDEX_OCR_ENABLED`, `ADMIN_EMAIL`, `ERROR_EMAIL`, `SMTP_HOST`,
 `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM`, `SMTP_FROM_NAME`, `ADMIN_PASSWORD`.
 
@@ -45,7 +45,7 @@ Keys outside the whitelist are ENV/code-only (e.g. `OPENROUTER_URL`, `LLM_TIMEOU
 | Model catalogue | `MODEL_CATALOG_MODELS` (``), `MODEL_CATALOG_SYNCED_AT` (``), `MODEL_CATALOG_ERROR` (``), `MODEL_CATALOG_TTL_MIN` (15) — see `/spec/model_catalog.md` |
 | OpenRouter | `OPENROUTER_API_KEY` (``), `OPENROUTER_URL` (chat/completions), `LLM_FALLBACK_MODEL` (`openrouter/auto`), `LLM_OCR_MODELS` (array, comma-split from ENV) |
 | Vision | `LLM_VISION_MODEL` (`yandex:qwen3.6-35b-a3b`) — the model for photos, labels and PDF pages. Accepts `"<provider>:<slug>"`, a short id, or a bare slug (bare = OpenRouter), so a Yandex multimodal model can be chosen here too (`/spec/llm.md` §2) |
-| Yandex Cloud | `YANDEX_API_KEY`, `YANDEX_FOLDER_ID`, `YANDEX_LLM_URL` (OpenAI-compatible), `YANDEX_OCR_URL` (`…/ocr/v1/recognizeText`), `YANDEX_OCR_MODEL` (`page`), `YANDEX_OCR_ENABLED` (`1`), `YANDEX_FALLBACK_MODEL` (`deepseek-r1`) |
+| Yandex Cloud | `YANDEX_API_KEY`, `YANDEX_FOLDER_ID`, `YANDEX_LLM_URL` (OpenAI-compatible), `YANDEX_MODELS_URL` (`…/foundationModels/v1/models` — the Models API the catalogue refresh asks first), `YANDEX_OCR_URL` (`…/ocr/v1/recognizeText`), `YANDEX_OCR_MODEL` (`page`), `YANDEX_OCR_ENABLED` (`1`), `YANDEX_FALLBACK_MODEL` (`yandexgpt-5-lite`) |
 | Timeouts | `LLM_TIMEOUT_SEC` (120), `LLM_MAX_RETRIES` (2) |
 | Admin gate | `ADMIN_PASSWORD` (``) |
 | Mail | `ADMIN_EMAIL`, `ERROR_EMAIL`, `SMTP_HOST` (`smtp.yandex.ru`), `SMTP_PORT` (465), `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM` (← `SMTP_USER`), `SMTP_FROM_NAME` |
@@ -65,12 +65,22 @@ for operator orientation only — nothing in the code charges by them. `provider
 model dropdowns in `setup.php` are built from this list with `ocr_only` rows filtered out.
 Adding a model = adding a row.
 
-The hardcoded Yandex rows are the slugs Yandex AI Studio actually serves (first-party
-`yandexgpt*`, open catalogue `llama-3.3-70b-instruct`, `phi-4`, and the multimodal
-`gemma-3-{4b,12b,27b}-it`, `qwen2.5-vl-72b-instruct`, `qwen3.6-35b-a3b`,
-`deepseek-vl2{,-tiny}`); an invented
-slug answers `Failed to get model` at call time, so rows are added only for models the
-provider's own catalogue lists.
+The hardcoded Yandex rows are the slugs the Yandex AI Studio model catalogue documents:
+first-party `aliceai-llm{,-flash}`, `yandexgpt-5.1`, `yandexgpt-5-{pro,lite}`,
+`deepseek-v4-flash`, `gpt-oss-{120b,20b}`, `qwen3-235b-a22b-fp8`; the open models
+`llama-3.{3,1}-70b-instruct`, `qwen2.5-{7b,32b,72b}-instruct`, `gemma-3-1b-it`; and the
+multimodal `gemma-3-{4b,12b,27b}-it`, `qwen3.6-35b-a3b`. An invented slug answers
+`Failed to get model` at call time, so rows are added only for models the catalogue
+lists — and even a documented one is a CANDIDATE, not a fact: the open models are enabled
+per folder and region, and what this folder really serves is what the Models API reports
+(`/spec/model_catalog.md` §4). Rows withdrawn from the catalogue (`deepseek-r1`,
+`deepseek-v3`, `phi-4`, `deepseek-vl2{,-tiny}`, `qwen2.5-vl-72b-instruct`) are gone from
+the list; a `settings` value still naming one keeps its own option in the dropdown, so a
+saved choice is never silently swapped.
+
+Rows also carry `context` — the model's context window in tokens — where the catalogue
+documents one; `price_in`/`price_out` stay `0.0` where no RUB estimate is worth stating,
+and the dropdown then shows the model without a price rather than an invented one.
 
 `qwen3.6-35b-a3b` — the default `LLM_VISION_MODEL` — is hardcoded with `vision => true`
 for a second reason: its slug carries no `-vl-` segment, so the name heuristic that flags

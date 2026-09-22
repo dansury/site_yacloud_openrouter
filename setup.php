@@ -335,7 +335,7 @@ if ($vision_cur !== '' && strpos($vision_cur, ':') === false) {
   $live_ttl    = (int) ($cfg['MODEL_CATALOG_TTL_MIN'] ?? ModelCatalog::TTL_MIN);
   ?>
   <p class="lede" style="margin:-4px 0 10px">
-    Список тянется прямо у провайдеров (OpenRouter <code>GET /models</code>, Yandex <code>GET /v1/models</code>)
+    Список тянется прямо у провайдеров (OpenRouter <code>GET /models</code>, Yandex <code>GET /foundationModels/v1/models</code>)
     и кэшируется в настройках. Каталог обновляется сам при заходе на эту страницу, если кэш старше
     <?= $live_ttl ?> мин; кнопка ниже обновляет сразу. Пока обновления не было — работает вшитый список.
     <?php if ($live_rows): ?>

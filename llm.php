@@ -298,7 +298,7 @@ final class LLM {
 
     /** Resolve the active model for the current request, honoring provider override. */
     private static function activeModel(): array {
-        $shortId = self::$modelOverride ?: (self::cfg()['LLM_DEFAULT_MODEL'] ?? 'deepseek-r1');
+        $shortId = self::$modelOverride ?: (self::cfg()['LLM_DEFAULT_MODEL'] ?? 'yandexgpt-5-lite');
         $effective = self::effectiveProvider();
         $row = self::findModel($shortId);
         // OCR-only models (Yandex Vision OCR) are not chat models.
@@ -309,7 +309,7 @@ final class LLM {
             }
         }
         if ($row !== null) return $row;
-        $default = self::findModel(self::cfg()['LLM_DEFAULT_MODEL'] ?? 'deepseek-r1');
+        $default = self::findModel(self::cfg()['LLM_DEFAULT_MODEL'] ?? 'yandexgpt-5-lite');
         if ($default !== null) {
             if (self::$providerOverride !== null && ($default['provider'] ?? '') !== $effective) {
                 $default['provider'] = $effective;
@@ -750,7 +750,7 @@ final class LLM {
 
         $fallbackModels = [
             'openrouter' => (string) ($cfg['LLM_FALLBACK_MODEL'] ?? 'openrouter/auto'),
-            'yandex'     => (string) ($cfg['YANDEX_FALLBACK_MODEL'] ?? 'deepseek-r1'),
+            'yandex'     => (string) ($cfg['YANDEX_FALLBACK_MODEL'] ?? 'yandexgpt-5-lite'),
         ];
         foreach (self::providerPriority() as $prov) {
             if ($prov === 'openrouter' && !$hasOR) continue;
