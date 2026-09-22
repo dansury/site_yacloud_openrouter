@@ -72,7 +72,12 @@ LLM::jsonCompact($v): string                        // JSON_UNESCAPED_UNICODE|SL
   leg to the diagnostic log (`/spec/diag_log.md`).
 - `chatJson` → `callJson` → `dispatch(json:true)` + `parseJson`. On unparseable JSON:
   one stricter re-ask (`step` suffixed `_retry`, `temp=0.0`, extra user turn demanding a
-  single JSON object, no markdown). Still unparseable → `RuntimeException`.
+  single JSON object, no markdown). The re-ask **names what went wrong with the previous
+  answer** (`json_last_error_msg()`, and «ответ оборвался по пределу длины» when
+  `lastTruncated()` says the provider stopped at the token limit) and, when truncated,
+  demands a shorter answer — asking again in the same words gets the same stump back.
+  Still unparseable → `RuntimeException` naming the reason, and `LLM_MAX_TOKENS` when
+  the answer was cut off.
 - `visionJson` → `callVisionJson` — same shape as `callJson` (dispatch + parseJson +
   one stricter re-ask), but the user turn is multimodal:
   `visionContent()` builds `[{type:text,...}?, {type:image_url,image_url:{url}}, ...]`
@@ -175,6 +180,7 @@ did not fail. `$trace` defaults to the last dispatch's.
 |---|---|
 | `пропущен:` (prefix) | *(none — a model we chose not to ask is not a failure)* |
 | `Failed to get model` | `модель не включена в каталоге облака` |
+| `not available via gRPC` / `use HTTP OpenAI API` | `модель отвечает только по OpenAI-совместимому адресу` |
 | `Access denied by security policy` | `запрос блокирует хостинг` |
 | `HTTP 401` / `HTTP 403` / `HTTP 429` | `ключ не принят` / `доступ к модели запрещён` / `превышен лимит запросов` |
 | `text is empty`, `empty message text` | `модель не приняла изображение` |
@@ -194,10 +200,12 @@ class is loaded; any error inside is swallowed.
 | Provider | URL | Headers | Model string |
 |---|---|---|---|
 | `openrouter` | `OPENROUTER_URL` | `Authorization: Bearer <OPENROUTER_API_KEY>`, `HTTP-Referer` (`OPENROUTER_REFERER`), `X-Title` (`OPENROUTER_TITLE`) | `full_id` |
-| `yandex` | `YANDEX_LLM_URL` (OpenAI-compatible) | `Authorization: Api-Key <YANDEX_API_KEY>`, `x-folder-id` | `yandexModelUri()` → `gpt://<folder>/<full_id>/latest` |
+| `yandex` | `YANDEX_LLM_URL` (OpenAI-compatible) or `YANDEX_LLM_URL_FM` (Foundation Models) — per model, see §5.1 | `Authorization: Api-Key <YANDEX_API_KEY>`, `x-folder-id` | `yandexModelUri()` → `gpt://<folder>/<full_id>/latest` |
 
 Body: `{model, messages, temperature}` + `response_format={"type":"json_object"}` when
-`$jsonMode` + any `$extra` keys merged in (used by OCR strategies). Timeouts:
+`$jsonMode` + `max_tokens` when `LLM_MAX_TOKENS > 0` (`0` = the provider's own default,
+so nothing that fits today starts being cut off) + any `$extra` keys merged in (used by
+OCR strategies). Timeouts:
 `CURLOPT_TIMEOUT = LLM_TIMEOUT_SEC`, `CURLOPT_CONNECTTIMEOUT = 15`. Missing credentials →
 throws before the request. HTTP ≥ 400 or transport error → `LLMHttpError` (extends `RuntimeException`)
 `"<PROVIDER> HTTP <code> @ <url> model=<model string>[ json_object]: <curl error | first
@@ -217,9 +225,50 @@ own error envelope (`{"error":{…}}`), otherwise `запрос к провай�
 something standing in front of the provider (hosting WAF, proxy), not from it. Every other
 status → `null`. Used by `dispatch()` (§4.2).
 
+### 5.1 Yandex has two endpoints — the route is asked, not assumed
+
+Yandex Cloud serves the same folder through two addresses, and not every model is on
+both: the YandexGPT family answers on `foundationModels/v1/completion`, the open models
+(Llama, Qwen, Gemma, DeepSeek, GPT-OSS) on the OpenAI-compatible `v1/chat/completions`.
+A model asked at the wrong address answers HTTP 400 — *"Model is not available via gRPC
+API. Please use HTTP OpenAI API instead"* — and the candidate is lost for a reason that
+has nothing to do with the model.
+
+| Function | Contract |
+|---|---|
+| `yandexRoute(string $slug): string` | `openai` \| `fm` — what this slug is known to answer on; `openai` (the configured `YANDEX_LLM_URL`) until something is learned |
+| `yandexRouteHint(string $error): ?string` | the route the provider's own refusal names, `null` when it names none |
+| `yandexFmBody(array $row, array $messages, float $temp, bool $json): array` | the Foundation Models request: `{modelUri, completionOptions:{stream,temperature,maxTokens?,responseFormat?}, messages:[{role,text}]}` |
+| `noteYandexRoute(string $slug, string $route)` *(private)* | remembers the route for the rest of the request |
+
+A Yandex candidate that fails with 400/404 is **re-asked once at the other address**, and
+the address that answered is remembered for the rest of the request. The re-ask happens
+when the provider named the other endpoint itself, or — at most once per request, and
+never after some Yandex call already succeeded at the configured address — blind: one
+extra request is cheaper than a silently lost candidate. Multimodal turns and `$extra`
+keys (OCR plugins) are never re-asked on the Foundation Models address: that shape has no
+images and no plugins there. The trace and the diagnostic log carry the address that
+answered (`yandex:gemma-3-27b-it@fm`).
+
+The Foundation Models answer (`result.alternatives[0]`) is normalized into the OpenAI
+shape before anything reads it, so `extractContent()`, `parseJson()` and the chain stay
+one code path.
+
+### 5.2 A truncated answer is never valid JSON
+
+`lastTruncated(): bool` — the provider says it stopped at the length limit:
+`finish_reason: length` on the OpenAI shape, `…TRUNCATED_FINAL` on the Foundation Models
+one. `callJson()` / `callVisionJson()` put that into the re-ask (§3) instead of repeating
+the same request, and the final exception points at `LLM_MAX_TOKENS`.
+
 Response helpers: `extractContent()` reads `choices[0].message.content`, joining
-`[{text:…}]` parts with `\n`; `parseJson()` strips ```` ```json ```` fences, then tries the
-outermost `{…}` slice, then the raw string.
+`[{text:…}]` parts with `\n`; `parseJson()` (public, pure — the test reads it without a
+network) strips ```` ```json ```` fences and `<think>` reasoning, takes the widest
+`{…}`/`[…]` slice, and repairs what a model commonly breaks: an answer cut off
+mid-value (the brackets the model opened are closed, nothing is invented), a trailing
+comma, «ёлочки» instead of straight quotes, raw line breaks inside a string literal, and
+bytes that are not valid UTF-8 (they make every `/u` pattern bail out, which turned the
+whole answer into «not JSON»).
 
 ## 6. PDF OCR — `ocrPdf()`
 
