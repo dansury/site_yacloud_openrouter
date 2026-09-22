@@ -22,6 +22,7 @@ require_once __DIR__ . '/llm.php';            // model list + auto-fallback prev
 require_once __DIR__ . '/model_catalog.php';  // live provider catalogue
 require_once __DIR__ . '/diag_log.php';       // operator-facing diagnostic log
 require_once __DIR__ . '/auto_pull.php';      // silent "is the deployed code the latest?" check
+require_once __DIR__ . '/selfheal/bootstrap.php';  // self-maintaining layer (own namespace)
 
 $cfg   = require __DIR__ . '/config.php';
 $store = new SettingsStore($cfg['DB_PATH']);
@@ -36,6 +37,17 @@ DiagLog::addSecret((string) ($cfg['YANDEX_API_KEY'] ?? ''));
 DiagLog::addSecret((string) ($cfg['SMTP_PASS'] ?? ''));
 DiagLog::addSecret((string) ($cfg['ADMIN_PASSWORD'] ?? ''));
 LLM::init($cfg, DiagLog::store());
+
+// Self-maintaining layer: error reports to the canonical repo (only with the
+// operator's consent), update notice with «Обновить» / «Откатить». Booting it
+// changes nothing else on this page — it installs chained handlers and returns.
+Selfheal\SelfHeal::boot([
+    'app'     => 'site_yacloud_openrouter/setup.php',
+    'secrets' => [
+        (string) ($cfg['OPENROUTER_API_KEY'] ?? ''), (string) ($cfg['YANDEX_API_KEY'] ?? ''),
+        (string) ($cfg['SMTP_PASS'] ?? ''), (string) ($cfg['ADMIN_PASSWORD'] ?? ''),
+    ],
+]);
 
 session_start();
 header('Cache-Control: no-store');
@@ -97,6 +109,14 @@ AutoPull::run($autopull_opts);
 
 $messages = [];
 $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
+
+// The module's own buttons (consent, update, rollback) are handled first and
+// return null for every POST that is not theirs, so nothing below changes.
+$selfheal_result = Selfheal\SelfHeal::handleAdminPost($_POST);
+if (is_array($selfheal_result)) {
+    $messages[] = ['ok' => !empty($selfheal_result['ok']),
+        'text' => (!empty($selfheal_result['ok']) ? '✅ Модуль: ' : '⚠️ Модуль: ') . (string) ($selfheal_result['note'] ?? '')];
+}
 
 if ($method === 'POST') {
     if (isset($_POST['model_catalog'])) {
@@ -305,6 +325,13 @@ if ($vision_cur !== '' && strpos($vision_cur, ':') === false) {
 <?php foreach ($messages as $m): ?>
   <div class="msg <?= $m['ok'] ? 'ok' : 'bad' ?>"><?= $h($m['text']) ?></div>
 <?php endforeach; ?>
+
+<?php
+/* Self-maintaining layer: the consent question while it is open, the "new
+   version" notice with «Обновить» / «Откатить», and the module's own status.
+   Returns '' when there is nothing to say. */
+echo Selfheal\SelfHeal::adminNotice();
+?>
 
 <form method="post" autocomplete="off">
   <input type="hidden" name="action" value="save">
