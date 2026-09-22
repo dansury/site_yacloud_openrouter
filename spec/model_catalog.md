@@ -66,7 +66,8 @@ ModelCatalog::newerSiblings(array $row, array $models): array
 | Provider | Request | Notes |
 |---|---|---|
 | OpenRouter | `GET` on `OPENROUTER_URL` with `/chat/completions` → `/models` | `Authorization: Bearer` added when `OPENROUTER_API_KEY` is set (the endpoint also answers without a key) |
-| Yandex | `GET` on `YANDEX_LLM_URL` with `/chat/completions` → `/models`, `Authorization: Api-Key` | requires `YANDEX_API_KEY` **and** `YANDEX_FOLDER_ID`; skipped with a reason otherwise |
+| Yandex | `GET` on `YANDEX_MODELS_URL` (`…/foundationModels/v1/models`) with `?folderId=<folder>`, `Authorization: Api-Key` + `x-folder-id` | the Models API — the list of what **this folder** really serves. Requires `YANDEX_API_KEY` **and** `YANDEX_FOLDER_ID`; skipped with a reason otherwise |
+| Yandex (fallback) | `GET` on `YANDEX_LLM_URL` with `/chat/completions` → `/models` | tried when the Models API is unavailable (older install, proxy, 404) or answers with no models; both failures are reported together |
 
 Transport: cURL, `Accept: application/json`, follow ≤ 3 redirects, timeout
 `clamp(LLM_TIMEOUT_SEC, 10, 30)` s, connect timeout 10 s. Non-JSON body, HTTP ≥ 400 or a
@@ -86,13 +87,18 @@ OpenRouter `data[]` entries need an `id` containing `/`; everything else is opti
 | `group` | `OpenRouter · <Vendor> (каталог)` / `Yandex AI Studio (каталог)` — the `<optgroup>` heading |
 | `price_in` / `price_out` | `0.0` — the hardcoded rows' RUB estimates are **not** invented for live rows |
 | `price_usd_in` / `price_usd_out` | OpenRouter `pricing.prompt` / `pricing.completion` × 1e6 (USD per 1M tokens), `0.0` when absent |
-| `context` | `context_length` when present |
+| `context` | OpenRouter `context_length`; Yandex `contextLength` / `context_length` / `maxTokens` / `maxInputTextTokens` when the answer states one, omitted otherwise |
 | `free` | `true` when both prices are 0 |
-| `vision` | the model accepts images — OpenRouter: `architecture.input_modalities` contains `image` (older payloads: the input half of `architecture.modality`); Yandex: name heuristic, since `GET /v1/models` answers with slugs only — `*-vl-*`, `*vl2*`, `*vision*`, `llava`, `pixtral`, `gemma-3-{4b,12b,27b}*`, `qwen*-vl*`. A Yandex vision row is also labelled and grouped `· зрение` |
+| `vision` | the model accepts images — OpenRouter: `architecture.input_modalities` contains `image` (older payloads: the input half of `architecture.modality`); Yandex: a stated modality (`modalities` / `inputModalities` / `input_modalities`) when the answer carries one, otherwise a name heuristic, since the list usually answers with slugs only — `*-vl-*`, `*vl2*`, `*vision*`, `llava`, `pixtral`, `gemma-3-{4b,12b,27b}*`, `qwen*-vl*`. A Yandex vision row is also labelled and grouped `· зрение` |
 | `live` | `true` |
 
-Yandex accepts both the OpenAI shape (`{data:[{id}]}`) and `{models:[{modelUri|uri|name}]}`;
-`items` is accepted as a wrapper too.
+Yandex accepts both the OpenAI shape (`{data:[{id}]}`) and `{models:[{modelUri|uri|id|name}]}`
+(`items` is accepted as a wrapper too), and an entry may be a bare slug string. The exact
+payload of the Models API differs between versions, which is why every field but the model
+uri is read optionally — a shape that is not recognized costs the extra fields, not the row.
+Entries of another folder, and uris that are not `gpt://` / `emb://` (`art://…`), are skipped.
+
+Covered by `tests/model_catalog_yandex.php`.
 
 ## 5. Model versions — `lineage()` / `newerSiblings()`
 

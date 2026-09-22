@@ -57,7 +57,8 @@ no TZ citations. Specs live in [`spec.md`](spec.md) + `spec/`.
   (a newer version of the same model first, then the operator's list, then the
   per-provider fallbacks), generic `chatText()` / `chatJson()`.
 - **Live model catalogue** (`model_catalog.php`) — the model list is pulled from the
-  providers themselves (OpenRouter `GET /models`, Yandex `GET /v1/models`) and cached in
+  providers themselves (OpenRouter `GET /models`, Yandex `GET /foundationModels/v1/models`,
+  falling back to the OpenAI-compatible `GET /v1/models`) and cached in
   the `settings` table; `setup.php` refreshes it on load when the cache is stale. The
   hardcoded list keeps working until (and after) the first refresh.
 - **Yandex OCR + PDF/DOCX parsing** (`parser.php`, `llm.php`) — DOCX via ZipArchive,
@@ -76,7 +77,7 @@ no TZ citations. Specs live in [`spec.md`](spec.md) + `spec/`.
   «Model is not available via gRPC API» stops costing a candidate.
 - **Vision models of both providers** — `LLM_VISION_MODEL` accepts `"<provider>:<slug>"`,
   so photos, labels and page scans can go to a Yandex multimodal model
-  (`gemma-3-27b-it`, `qwen2.5-vl-72b-instruct`, `deepseek-vl2`) as well as to OpenRouter.
+  (`qwen3.6-35b-a3b`, `gemma-3-{4b,12b,27b}-it`) as well as to OpenRouter.
 - **Diagnostic log** (`diag_log.php`) — every model call, every failure and every
   self-test lands in a `diag_log` table next to the settings; `setup.php` shows it as two
   copyable blocks (everything / errors only) with the environment header prepended. API

@@ -33,7 +33,7 @@ if (!function_exists('cfg_settings_whitelist')) {
             'MODEL_CATALOG_TTL_MIN',
             'LLM_OCR_MODELS', 'YANDEX_FALLBACK_MODEL',
             'YANDEX_API_KEY', 'YANDEX_FOLDER_ID', 'YANDEX_LLM_URL', 'YANDEX_LLM_URL_FM',
-            'LLM_MAX_TOKENS',
+            'YANDEX_MODELS_URL', 'LLM_MAX_TOKENS',
             'YANDEX_OCR_URL', 'YANDEX_OCR_MODEL', 'YANDEX_OCR_ENABLED',
             'ADMIN_EMAIL', 'ERROR_EMAIL',
             'SMTP_HOST', 'SMTP_PORT', 'SMTP_USER', 'SMTP_PASS', 'SMTP_FROM', 'SMTP_FROM_NAME',
@@ -64,10 +64,10 @@ $config = [
     'OPENROUTER_URL'        => 'https://openrouter.ai/api/v1/chat/completions',
     'LLM_VISION_MODEL'      => cfg_env('LLM_VISION_MODEL', 'yandex:qwen3.6-35b-a3b'),
     'LLM_FALLBACK_MODEL'    => cfg_env('LLM_FALLBACK_MODEL', 'openrouter/auto'),
-    'YANDEX_FALLBACK_MODEL' => cfg_env('YANDEX_FALLBACK_MODEL', 'deepseek-r1'),
+    'YANDEX_FALLBACK_MODEL' => cfg_env('YANDEX_FALLBACK_MODEL', 'yandexgpt-5-lite'),
     /* ── Live model catalogue ─────────────────────────────────────────────
        The model list is pulled from the providers (OpenRouter GET /models,
-       Yandex GET /v1/models) and cached in `settings`. setup.php refreshes the
+       Yandex GET /foundationModels/v1/models) and cached in `settings`. setup.php refreshes the
        cache on load once it is older than MODEL_CATALOG_TTL_MIN minutes; here
        the stored JSON is only parsed — no network (see ModelCatalog). */
     'MODEL_CATALOG_MODELS'    => '',   // JSON catalogue rows; filled from settings
@@ -88,6 +88,9 @@ $config = [
     // YandexGPT family answers here, the open ones on the OpenAI-compatible URL
     // above. Which slug needs which is asked, not assumed (spec/llm.md §5.1).
     'YANDEX_LLM_URL_FM'     => cfg_env('YANDEX_LLM_URL_FM', 'https://llm.api.cloud.yandex.net/foundationModels/v1/completion'),
+    // Models API: the folder's real model list (GET, folderId in the query). The
+    // OpenAI-compatible /v1/models is the fallback when this one is unavailable.
+    'YANDEX_MODELS_URL'     => cfg_env('YANDEX_MODELS_URL', 'https://llm.api.cloud.yandex.net/foundationModels/v1/models'),
     // Yandex Vision OCR (https://yandex.cloud/docs/vision/concepts/ocr).
     'YANDEX_OCR_URL'        => cfg_env('YANDEX_OCR_URL', 'https://ocr.api.cloud.yandex.net/ocr/v1/recognizeText'),
     'YANDEX_OCR_MODEL'      => cfg_env('YANDEX_OCR_MODEL', 'page'),
@@ -134,24 +137,35 @@ $config = [
        absence as "maybe" and only ever SKIPS rows explicitly marked false. ── */
     'AVAILABLE_MODELS'      => [
         // `group` names the <optgroup> the row lands in (setup.php dropdown).
-        // ── Yandex AI Studio — first-party ──
-        ['id' => 'deepseek-r1',    'label' => 'DeepSeek R1',     'provider' => 'yandex', 'full_id' => 'deepseek-r1',    'group' => 'Yandex AI Studio', 'price_in' => 1.20, 'price_out' => 1.20, 'vision' => false],
-        ['id' => 'deepseek-v3',    'label' => 'DeepSeek V3',     'provider' => 'yandex', 'full_id' => 'deepseek-v3',    'group' => 'Yandex AI Studio', 'price_in' => 0.50, 'price_out' => 0.50, 'vision' => false],
-        ['id' => 'yandexgpt',      'label' => 'YandexGPT Pro',   'provider' => 'yandex', 'full_id' => 'yandexgpt',      'group' => 'Yandex AI Studio', 'price_in' => 1.20, 'price_out' => 1.20, 'vision' => false],
-        ['id' => 'yandexgpt-lite', 'label' => 'YandexGPT Lite',  'provider' => 'yandex', 'full_id' => 'yandexgpt-lite', 'group' => 'Yandex AI Studio', 'price_in' => 0.20, 'price_out' => 0.20, 'vision' => false],
-        // ── Yandex AI Studio — open catalogue (slug = gpt://folder/<full_id>/latest) ──
-        ['id' => 'llama-3.3-70b-instruct', 'label' => 'Llama 3.3 70B Instruct', 'provider' => 'yandex', 'full_id' => 'llama-3.3-70b-instruct', 'group' => 'Yandex AI Studio', 'price_in' => 0.50, 'price_out' => 0.50, 'vision' => false],
-        ['id' => 'phi-4',                  'label' => 'Phi-4',                  'provider' => 'yandex', 'full_id' => 'phi-4',                  'group' => 'Yandex AI Studio', 'price_in' => 0.25, 'price_out' => 0.25, 'vision' => false],
+        // ── Yandex AI Studio — first-party (Yandex AI Studio model catalogue) ──
+        // `context` — the model's context window in tokens, as the catalogue documents it.
+        // `price_in`/`price_out` stay 0.0 where no RUB estimate is worth stating: the
+        // dropdown then shows the model without an invented price.
+        ['id' => 'aliceai-llm',       'label' => 'Alice AI LLM',       'provider' => 'yandex', 'full_id' => 'aliceai-llm',       'group' => 'Yandex AI Studio', 'price_in' => 0.0,  'price_out' => 0.0,  'context' => 131072,  'vision' => false],
+        ['id' => 'aliceai-llm-flash', 'label' => 'Alice AI LLM Flash', 'provider' => 'yandex', 'full_id' => 'aliceai-llm-flash', 'group' => 'Yandex AI Studio', 'price_in' => 0.0,  'price_out' => 0.0,  'context' => 65536,   'vision' => false],
+        ['id' => 'yandexgpt-5.1',     'label' => 'YandexGPT Pro 5.1',  'provider' => 'yandex', 'full_id' => 'yandexgpt-5.1',     'group' => 'Yandex AI Studio', 'price_in' => 1.20, 'price_out' => 1.20, 'context' => 32768,   'vision' => false],
+        ['id' => 'yandexgpt-5-pro',   'label' => 'YandexGPT Pro 5',    'provider' => 'yandex', 'full_id' => 'yandexgpt-5-pro',   'group' => 'Yandex AI Studio', 'price_in' => 1.20, 'price_out' => 1.20, 'context' => 32768,   'vision' => false],
+        ['id' => 'yandexgpt-5-lite',  'label' => 'YandexGPT Lite 5',   'provider' => 'yandex', 'full_id' => 'yandexgpt-5-lite',  'group' => 'Yandex AI Studio', 'price_in' => 0.20, 'price_out' => 0.20, 'context' => 32768,   'vision' => false],
+        ['id' => 'deepseek-v4-flash', 'label' => 'DeepSeek V4 Flash',  'provider' => 'yandex', 'full_id' => 'deepseek-v4-flash', 'group' => 'Yandex AI Studio', 'price_in' => 0.0,  'price_out' => 0.0,  'context' => 1048576, 'vision' => false],
+        ['id' => 'gpt-oss-120b',      'label' => 'gpt-oss-120b',       'provider' => 'yandex', 'full_id' => 'gpt-oss-120b',      'group' => 'Yandex AI Studio', 'price_in' => 0.0,  'price_out' => 0.0,  'context' => 131072,  'vision' => false],
+        ['id' => 'gpt-oss-20b',       'label' => 'gpt-oss-20b',        'provider' => 'yandex', 'full_id' => 'gpt-oss-20b',       'group' => 'Yandex AI Studio', 'price_in' => 0.0,  'price_out' => 0.0,  'context' => 131072,  'vision' => false],
+        ['id' => 'qwen3-235b-a22b-fp8', 'label' => 'Qwen3 235B',       'provider' => 'yandex', 'full_id' => 'qwen3-235b-a22b-fp8', 'group' => 'Yandex AI Studio', 'price_in' => 0.0, 'price_out' => 0.0, 'context' => 262144, 'vision' => false],
+        // ── Yandex AI Studio — open catalogue (slug = gpt://folder/<full_id>/latest).
+        //    Enabled per folder and region: what this folder really serves is what the
+        //    Models API reports (ModelCatalog::fetchYandex), these rows are candidates. ──
+        ['id' => 'llama-3.3-70b-instruct',  'label' => 'Llama 3.3 70B Instruct',  'provider' => 'yandex', 'full_id' => 'llama-3.3-70b-instruct',  'group' => 'Yandex AI Studio', 'price_in' => 0.50, 'price_out' => 0.50, 'vision' => false],
+        ['id' => 'llama-3.1-70b-instruct',  'label' => 'Llama 3.1 70B Instruct',  'provider' => 'yandex', 'full_id' => 'llama-3.1-70b-instruct',  'group' => 'Yandex AI Studio', 'price_in' => 0.50, 'price_out' => 0.50, 'vision' => false],
+        ['id' => 'qwen2.5-72b-instruct',    'label' => 'Qwen2.5 72B Instruct',    'provider' => 'yandex', 'full_id' => 'qwen2.5-72b-instruct',    'group' => 'Yandex AI Studio', 'price_in' => 0.50, 'price_out' => 0.50, 'vision' => false],
+        ['id' => 'qwen2.5-32b-instruct',    'label' => 'Qwen2.5 32B Instruct',    'provider' => 'yandex', 'full_id' => 'qwen2.5-32b-instruct',    'group' => 'Yandex AI Studio', 'price_in' => 0.30, 'price_out' => 0.30, 'vision' => false],
+        ['id' => 'qwen2.5-7b-instruct',     'label' => 'Qwen2.5 7B Instruct',     'provider' => 'yandex', 'full_id' => 'qwen2.5-7b-instruct',     'group' => 'Yandex AI Studio', 'price_in' => 0.15, 'price_out' => 0.15, 'vision' => false],
+        ['id' => 'gemma-3-1b-it',           'label' => 'Gemma 3 1B IT',           'provider' => 'yandex', 'full_id' => 'gemma-3-1b-it',           'group' => 'Yandex AI Studio', 'price_in' => 0.10, 'price_out' => 0.10, 'vision' => false],
         // Multimodal Yandex rows — what a photo / label / scan can be sent to.
         ['id' => 'gemma-3-4b-it',   'label' => 'Gemma 3 4B IT (зрение)',   'provider' => 'yandex', 'full_id' => 'gemma-3-4b-it',   'group' => 'Yandex AI Studio · зрение', 'price_in' => 0.15, 'price_out' => 0.15, 'vision' => true],
         ['id' => 'gemma-3-12b-it',  'label' => 'Gemma 3 12B IT (зрение)',  'provider' => 'yandex', 'full_id' => 'gemma-3-12b-it',  'group' => 'Yandex AI Studio · зрение', 'price_in' => 0.30, 'price_out' => 0.30, 'vision' => true],
         ['id' => 'gemma-3-27b-it',  'label' => 'Gemma 3 27B IT (зрение)',  'provider' => 'yandex', 'full_id' => 'gemma-3-27b-it',  'group' => 'Yandex AI Studio · зрение', 'price_in' => 0.45, 'price_out' => 0.45, 'vision' => true],
-        ['id' => 'qwen2.5-vl-72b-instruct', 'label' => 'Qwen2.5 VL 72B (зрение)', 'provider' => 'yandex', 'full_id' => 'qwen2.5-vl-72b-instruct', 'group' => 'Yandex AI Studio · зрение', 'price_in' => 0.80, 'price_out' => 0.80, 'vision' => true],
-        // Ready in Yandex AI Studio; slug has no "-vl-" segment, so ModelCatalog::yandexSeesImages()
-        // (name-based heuristic, see T072) can't auto-detect it — hardcoded here as the default vision model.
-        ['id' => 'qwen3.6-35b-a3b', 'label' => 'Qwen3.6 35B A3B (зрение)', 'provider' => 'yandex', 'full_id' => 'qwen3.6-35b-a3b', 'group' => 'Yandex AI Studio · зрение', 'price_in' => 0.35, 'price_out' => 0.35, 'vision' => true],
-        ['id' => 'deepseek-vl2',      'label' => 'DeepSeek VL 2 (зрение)',      'provider' => 'yandex', 'full_id' => 'deepseek-vl2',      'group' => 'Yandex AI Studio · зрение', 'price_in' => 0.50, 'price_out' => 0.50, 'vision' => true],
-        ['id' => 'deepseek-vl2-tiny', 'label' => 'DeepSeek VL 2 Tiny (зрение)', 'provider' => 'yandex', 'full_id' => 'deepseek-vl2-tiny', 'group' => 'Yandex AI Studio · зрение', 'price_in' => 0.20, 'price_out' => 0.20, 'vision' => true],
+        // Slug has no "-vl-" segment, so ModelCatalog::yandexSeesImages() (name-based
+        // heuristic, see T072) can't auto-detect it — hardcoded here as the default vision model.
+        ['id' => 'qwen3.6-35b-a3b', 'label' => 'Qwen3.6 35B A3B (зрение)', 'provider' => 'yandex', 'full_id' => 'qwen3.6-35b-a3b', 'group' => 'Yandex AI Studio · зрение', 'price_in' => 0.35, 'price_out' => 0.35, 'context' => 262144, 'vision' => true],
         // ── Yandex Vision OCR (PDF text recognition, not a chat model) ──
         ['id' => 'yandex-vision-ocr', 'label' => 'Yandex Vision OCR (PDF)', 'provider' => 'yandex', 'full_id' => 'yandex-ocr-page', 'group' => 'Yandex Vision', 'price_in' => 0.0, 'price_out' => 0.0, 'ocr_only' => true],
         // ── OpenRouter ──

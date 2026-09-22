@@ -6,7 +6,8 @@
  *
  * Why: `config.php → AVAILABLE_MODELS` is a hardcoded list that ages with the
  * release. Providers publish their own catalogue over HTTP: OpenRouter via
- * GET /api/v1/models, Yandex via GET /v1/models (OpenAI-compatible mode). This
+ * GET /api/v1/models, Yandex via the Models API GET /foundationModels/v1/models
+ * (falling back to the OpenAI-compatible GET /v1/models). This
  * class fetches them, normalizes the answer into CATALOGUE ROWS (same keys as
  * AVAILABLE_MODELS) and stores the JSON in `settings`.
  *
@@ -266,19 +267,57 @@ final class ModelCatalog {
     }
 
     /**
-     * Yandex: GET /v1/models in OpenAI-compatible mode. What comes back depends
-     * on the key and on the models enabled in the cloud folder. Both the OpenAI
-     * shape ({data:[{id}]}) and {models:[{modelUri|uri|name}]} are accepted.
+     * Yandex: the folder's own model list. Two sources, in this order:
+     *
+     *   1. Models API — `GET <YANDEX_MODELS_URL>?folderId=<folder>`. This is the
+     *      list the docs point at ("точный список моделей, доступных именно в
+     *      вашем каталоге"): open models are enabled per folder and region, so a
+     *      slug from the published catalogue is a candidate, not a fact.
+     *   2. The OpenAI-compatible `GET /v1/models` — used when the Models API is
+     *      unavailable (older install, proxy, 404), so the refresh keeps working.
+     *
+     * Both answers are read by the same normalizer: `{models:[…]}`, `{data:[…]}`
+     * and `{items:[…]}` wrappers, and entries that are either a bare slug string
+     * or an object carrying `modelUri` / `uri` / `id` / `name`.
      */
-    private static function fetchYandex(array $cfg): array {
+    private static function fetchYandex(array $cfg): array
+    {
         $key    = (string) ($cfg['YANDEX_API_KEY'] ?? '');
         $folder = (string) ($cfg['YANDEX_FOLDER_ID'] ?? '');
         if ($key === '' || $folder === '') throw new RuntimeException('no API key or folder id');
-        $url = (string) preg_replace('~/chat/completions$~', '/models', (string) ($cfg['YANDEX_LLM_URL'] ?? ''));
-        if ($url === '') throw new RuntimeException('YANDEX_LLM_URL is empty');
-        $j = self::httpGetJson($url, ['Accept: application/json', 'Authorization: Api-Key ' . $key], $cfg);
+        $headers = ['Accept: application/json', 'Authorization: Api-Key ' . $key, 'x-folder-id: ' . $folder];
+
+        $errors = [];
+        foreach (self::yandexModelUrls($cfg, $folder) as $label => $url) {
+            try {
+                $rows = self::yandexRows(self::httpGetJson($url, $headers, $cfg), $folder);
+                if ($rows) return $rows;
+                $errors[] = $label . ': no models in the response';
+            } catch (RuntimeException $e) {
+                $errors[] = $label . ': ' . $e->getMessage();
+            }
+        }
+        throw new RuntimeException(implode('; ', $errors ?: ['no Yandex model endpoint configured']));
+    }
+
+    /** The endpoints tried, in order: Models API first, OpenAI-compatible second. */
+    private static function yandexModelUrls(array $cfg, string $folder): array
+    {
+        $urls = [];
+        $models = trim((string) ($cfg['YANDEX_MODELS_URL'] ?? ''));
+        if ($models !== '') {
+            $urls['models API'] = $models . (strpos($models, '?') === false ? '?' : '&') . 'folderId=' . rawurlencode($folder);
+        }
+        $compat = (string) preg_replace('~/chat/completions$~', '/models', (string) ($cfg['YANDEX_LLM_URL'] ?? ''));
+        if ($compat !== '' && $compat !== $models) $urls['/v1/models'] = $compat;
+        return $urls;
+    }
+
+    /** One decoded answer → catalogue rows. Entries of another folder are skipped. */
+    private static function yandexRows(array $j, string $folder): array
+    {
         $list = [];
-        foreach (['data', 'models', 'items'] as $k) {
+        foreach (['models', 'data', 'items'] as $k) {
             if (isset($j[$k]) && is_array($j[$k])) { $list = $j[$k]; break; }
         }
         $rows = [];
@@ -287,14 +326,14 @@ final class ModelCatalog {
             if (is_string($m)) {
                 $raw = $m;
             } elseif (is_array($m)) {
-                foreach (['id', 'modelUri', 'uri', 'name'] as $k) {
+                foreach (['modelUri', 'uri', 'id', 'name'] as $k) {
                     if (isset($m[$k]) && is_string($m[$k])) { $raw = $m[$k]; break; }
                 }
             }
             $slug = self::yandexSlug($raw, $folder);
             if ($slug === null) continue;
-            $vision = self::yandexSeesImages($slug);
-            $rows[] = [
+            $vision = self::yandexSeesImages($slug) || (is_array($m) && self::yandexReportsImages($m));
+            $row = [
                 'id'       => 'ya-' . self::shortId($slug),
                 'label'    => $slug . ($vision ? ' (зрение)' : ''),
                 'provider' => 'yandex',
@@ -304,9 +343,38 @@ final class ModelCatalog {
                 'vision'   => $vision,
                 'live'     => true,
             ];
+            $context = is_array($m) ? self::yandexContext($m) : 0;
+            if ($context > 0) $row['context'] = $context;
+            $rows[] = $row;
         }
-        if (!$rows) throw new RuntimeException('no models in the response');
         return $rows;
+    }
+
+    /** Context window, when the Models API states one (field name varies by version). */
+    private static function yandexContext(array $m): int
+    {
+        foreach (['contextLength', 'context_length', 'maxTokens', 'maxInputTextTokens', 'context'] as $k) {
+            if (isset($m[$k]) && is_numeric($m[$k])) return (int) $m[$k];
+        }
+        return 0;
+    }
+
+    /** Does the model's own entry say it takes images? Only a stated modality counts. */
+    private static function yandexReportsImages(array $m): bool
+    {
+        foreach (['modalities', 'inputModalities', 'input_modalities'] as $k) {
+            if (!isset($m[$k])) continue;
+            $val = $m[$k];
+            if (is_array($val)) {
+                foreach ($val as $mod) {
+                    if (is_string($mod) && strpos(strtolower($mod), 'image') !== false) return true;
+                }
+            } elseif (is_string($val)) {
+                $in = explode('->', strtolower($val))[0];
+                if (strpos($in, 'image') !== false) return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -332,9 +400,10 @@ final class ModelCatalog {
     }
 
     /**
-     * Yandex `GET /v1/models` answers with slugs only — no modality field — so
-     * the multimodal families are recognized by name: the VL / vision lines and
-     * Gemma 3 (its 4b/12b/27b instruct weights take images).
+     * Yandex usually answers with slugs and no modality field, so the multimodal
+     * families are recognized by name: the VL / vision lines and Gemma 3 (its
+     * 4b/12b/27b instruct weights take images). A modality the answer DOES state
+     * is honoured on top of this (yandexReportsImages()).
      */
     private static function yandexSeesImages(string $slug): bool {
         $s = strtolower($slug);
