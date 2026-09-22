@@ -3,3 +3,12 @@ data/logs/
 .env
 data/auto-pull.json
 data/auto-pull.json.lock
+
+# self-maintaining layer: own state + update staging/backups.
+# selfheal/token.php is NOT ignored — the sealed credential ships with the code.
+# selfheal/token.local.php IS ignored — it is the operator's own token.
+data/selfheal.db
+data/selfheal.db-wal
+data/selfheal.db-shm
+data/selfheal/
+selfheal/token.local.php

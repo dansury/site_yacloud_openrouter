@@ -22,7 +22,17 @@
 ## Rules
 
 - **No secrets in code.** Every key/credential arrives from ENV or the `settings`
-  table (`setup.php`). Defaults in `config.php` are non-secret placeholders.
+  table (`setup.php`). Defaults in `config.php` are non-secret placeholders. The
+  single, deliberate exception is the sealed reporting credential in
+  `selfheal/token.php` — see `/spec/selfheal.md` §4, including the scope it is
+  restricted to and what sealing does and does not protect against.
+- **The public API is frozen.** `Selfheal\Contract::PUBLIC_API` is what consuming
+  projects may call; `API_VERSION` is semver over that surface only, and a major
+  bump never reaches users through the auto-updater. Everything else in
+  `selfheal/` is internal. See `/spec/selfheal.md` §2.
+- **Reporting is opt-in, always.** Nothing leaves an install until the operator
+  says yes; the assistant installing the module must ask (`AGENTS.md` §1), and
+  every user-visible error says what happened to it. See `/spec/selfheal.md` §7.
 - **Config resolution order (per key):** `settings` DB row > process ENV >
   `config.php` fallback. Only whitelisted keys (`cfg_settings_whitelist()`) may be
   overlaid from the DB.
@@ -52,6 +62,7 @@
 | `/spec/settings.md` | `config.php`, `settings_store.php`, `setup.php` — config resolution, `settings` table, admin page |
 | `/spec/diag_log.md` | `diag_log.php` — diagnostic log, redaction, reset on redeploy |
 | `/spec/auto_pull.md` | `auto_pull.php` — silent GitHub head check on every page, deploy through `pull.php`, redirect back |
+| `/spec/selfheal.md` | `selfheal/*`, `selfheal_install.php`, `selfheal_seal.php`, `selfheal_admin.php`, `module.json` — self-maintaining layer: isolation, error reports to issues, consent, sealed credential, capability keys, verified update + rollback |
 
 ---
 
@@ -68,8 +79,16 @@
 | `diag_log.php`       | `/spec/diag_log.md` |
 | `setup.php`          | `/spec/settings.md` |
 | `auto_pull.php`      | `/spec/auto_pull.md` |
+| `selfheal/*.php`     | `/spec/selfheal.md` |
+| `module.json`        | `/spec/selfheal.md` §2 |
+| `selfheal_install.php` | `/spec/selfheal.md` §12 |
+| `selfheal_seal.php`  | `/spec/selfheal.md` §4.2 |
+| `selfheal_admin.php` | `/spec/selfheal.md` §11.2 |
+| `AGENTS.md`          | operator/assistant instructions (not a spec) |
 | `example.php`        | `/spec/llm.md` §6 (CLI smoke modes) |
 | `tests/llm_chain.php` | `/spec/llm.md` §4 (candidate chain, run: `php tests/llm_chain.php`) |
+| `tests/selfheal_smoke.php` | `/spec/selfheal.md` §13.1 (run: `php tests/selfheal_smoke.php`) |
+| `tests/selfheal_update.php` | `/spec/selfheal.md` §13.2 (run: `php tests/selfheal_update.php`) |
 
 ---
 
@@ -84,6 +103,8 @@ absent → PDF goes straight to OCR.
 
 | Path | Content |
 |---|---|
+| `data/selfheal.db` | SQLite; the self-maintaining layer's OWN state — settings, report queue, fingerprint→issue map (`/spec/selfheal.md` §3). Deliberately not `DB_PATH` |
+| `data/selfheal/` | update staging, downloads and backups (`/spec/selfheal.md` §10) |
 | `DB_PATH` (default `data/app.db`) | SQLite; table `settings` (see `/spec/settings.md` §2) — also holds the cached model catalogue (`/spec/model_catalog.md` §2) and the diagnostic log (`/spec/diag_log.md` §1) |
 | `LOG_DIR` (default `data/logs`)   | `error_email_throttle.json` (see `/spec/mailer.md` §5) |
 | `dirname(DB_PATH)` | `auto-pull.json` — last deploy check (see `/spec/auto_pull.md` §4) |
