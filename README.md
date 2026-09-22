@@ -69,6 +69,11 @@ no TZ citations. Specs live in [`spec.md`](spec.md) + `spec/`.
   (default, three backups, per-provider fallbacks, vision), never free text, and
   "Проверить модели и ключи" runs one real completion per leg so a wrong key or a model
   the cloud folder does not serve is named immediately.
+- **Two Yandex addresses, one model list** (`llm.php`) — not every model of a cloud folder
+  answers on both `v1/chat/completions` and `foundationModels/v1/completion`. A model
+  refused at one address is re-asked once at the other, the address that answered is
+  remembered for the rest of the request and shown in the trace (`yandex:gemma@fm`), so
+  «Model is not available via gRPC API» stops costing a candidate.
 - **Vision models of both providers** — `LLM_VISION_MODEL` accepts `"<provider>:<slug>"`,
   so photos, labels and page scans can go to a Yandex multimodal model
   (`gemma-3-27b-it`, `qwen2.5-vl-72b-instruct`, `deepseek-vl2`) as well as to OpenRouter.
@@ -95,7 +100,8 @@ no TZ citations. Specs live in [`spec.md`](spec.md) + `spec/`.
 No app coupling, no hardcoded secrets in the app layer — everything is env- or
 `settings`-driven. The one deliberate exception is the **sealed** reporting
 credential in `selfheal/token.php`: a fine-grained GitHub PAT limited to this one
-repository with `Issues: Read and write` only, encrypted so scanners and casual
+repository whose only write permission is `Issues: Read and write` (read-only
+`Contents`/`Metadata` is what the updater uses), encrypted so scanners and casual
 reading do not find it. It is sealed, not secret — see `selfheal/Vault.php`.
 
 ## Files

@@ -119,9 +119,20 @@ Does not: withstand someone who owns the machine. Inherent to shipping a
 credential inside distributed code.
 
 Therefore the shipped token **must** be a fine-grained PAT limited to the one
-canonical repository with the single permission *Issues: Read and write*. The
-blast radius of a leak is then noise in one issue tracker, fixed by revoking
-one token.
+canonical repository whose only **write** permission is *Issues: Read and
+write*. Read-only *Contents / Metadata* is permitted and is what the updater
+uses (`module.json` + the release zipball); on a public repository it grants
+nothing an anonymous request could not do. Forbidden: Contents write,
+workflows, packages, secrets, actions, administration, org access, a second
+repository, and classic PATs (which cannot be scoped to one repository at all).
+The blast radius of a leak is then noise in one issue tracker, fixed by revoking
+one token — such a token cannot write code, releases or any other repository.
+
+Note for anyone validating a token from inside a sandboxed agent environment:
+outbound GitHub traffic there may be re-authenticated by a proxy, in which case
+an API probe reflects the session's permissions rather than the token's. Verify
+a sealed token on the real server (`php selfheal_seal.php --check` plus one real
+flush from the admin panel), not from such a sandbox.
 
 ### 4.2 Format
 

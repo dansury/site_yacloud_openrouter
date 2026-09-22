@@ -18,12 +18,17 @@
  *
  * The consequence is a hard rule on what the token may be:
  *   → a FINE-GRAINED GitHub PAT, scoped to exactly ONE repository
- *     (dansury/site_yacloud_openrouter), with exactly ONE permission:
- *     "Issues: Read and write". Nothing else. No contents, no workflows,
- *     no metadata write, no org access, no second repo.
+ *     (dansury/site_yacloud_openrouter), whose ONLY write permission is
+ *     "Issues: Read and write".
+ *     Read-only "Contents / Metadata: Read" is allowed and is what the updater
+ *     uses (module.json + the release zipball); on a public repository it adds
+ *     nothing an anonymous request could not do anyway.
+ *     NEVER: Contents write, workflows, packages, secrets, actions, org access,
+ *     administration, or a second repository. NEVER a classic PAT (ghp_) —
+ *     those cannot be narrowed to one repository at all.
  * Worst case for a leaked token is then noise in this repo's issue tracker,
  * cleaned up by revoking one token. Code, releases and every other repository
- * stay untouchable.
+ * stay untouchable — the token cannot write them.
  *
  * A host that would rather ship no credential at all sets SELFHEAL_RELAY_URL
  * and keeps `token.php` absent — see spec §4.3.

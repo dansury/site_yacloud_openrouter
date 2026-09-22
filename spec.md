@@ -87,6 +87,7 @@
 | `AGENTS.md`          | operator/assistant instructions (not a spec) |
 | `example.php`        | `/spec/llm.md` §6 (CLI smoke modes) |
 | `tests/llm_chain.php` | `/spec/llm.md` §4 (candidate chain, run: `php tests/llm_chain.php`) |
+| `tests/llm_json.php` | `/spec/llm.md` §5.1–5.2 (Yandex address, answer parsing, run: `php tests/llm_json.php`) |
 | `tests/selfheal_smoke.php` | `/spec/selfheal.md` §13.1 (run: `php tests/selfheal_smoke.php`) |
 | `tests/selfheal_update.php` | `/spec/selfheal.md` §13.2 (run: `php tests/selfheal_update.php`) |
 

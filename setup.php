@@ -184,7 +184,7 @@ if ($method === 'POST') {
         // String settings. Empty values never overwrite existing.
         $map = [
             'LLM_PROVIDER', 'LLM_PROVIDER_PRIORITY', 'LLM_DEFAULT_MODEL',
-            'LLM_FALLBACK_MODE', 'MODEL_CATALOG_TTL_MIN',
+            'LLM_FALLBACK_MODE', 'MODEL_CATALOG_TTL_MIN', 'LLM_MAX_TOKENS',
             'LLM_OCR_MODELS', 'YANDEX_OCR_MODEL',
             'OPENROUTER_API_KEY', 'YANDEX_API_KEY', 'YANDEX_FOLDER_ID',
             'ADMIN_EMAIL', 'ERROR_EMAIL',
@@ -423,6 +423,13 @@ echo Selfheal\SelfHeal::adminNotice();
   <p class="lede" style="margin:-4px 0 8px">
     Модель, которой нет в живом каталоге провайдера, в запасные не подставляется: слепой запрос к ней
     отвечает <code>Failed to get model</code> и прячет настоящую причину сбоя.
+  </p>
+  <label><span>Предел длины ответа, токенов — 0 значит «сколько даст провайдер»</span>
+    <input type="number" name="LLM_MAX_TOKENS" min="0" placeholder="<?= $h((string) $eff('LLM_MAX_TOKENS')) ?>"></label>
+  <p class="lede" style="margin:-4px 0 8px">
+    Пусто или 0 — предел выбирает провайдер, и ничего из того, что помещается сейчас, обрезаться не начнёт.
+    Поднимать это число стоит тогда, когда в логе появляется «ответ оборвался по пределу длины»:
+    оборванный ответ никогда не разбирается как JSON.
   </p>
   <label><span>OCR-модели OpenRouter (через запятую, по порядку)</span><input type="text" name="LLM_OCR_MODELS" placeholder="<?= $h($ocr_models_eff ?: 'google/gemini-2.5-flash,google/gemini-2.0-flash-001') ?>"></label>
   <label><span>Yandex Vision OCR модель</span><input type="text" name="YANDEX_OCR_MODEL" placeholder="<?= $h($eff('YANDEX_OCR_MODEL') ?: 'page') ?>"></label>
