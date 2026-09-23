@@ -163,6 +163,14 @@ stamp, masked keys, `LLM::configSummary()`) — with a copy-to-clipboard button 
 picks `smtp_test_to` or `ADMIN_EMAIL`, calls `Mailer::sendTest` and renders ✅ with
 host:port or ⚠️ with the exception message.
 
+**Where a result shows.** Every message carries a spot: `top` (save, module buttons,
+log clear) or the id of the section whose button produced it — `catalog`,
+`autopull`, `probe`, `smtp`. `$render_msgs($at)` prints a spot's messages; the
+section ones render right under their button, and those buttons post to
+`setup.php#<spot>`, so the browser lands on the answer instead of the page top
+(on a phone the top is several screens away and the click looks like nothing
+happened).
+
 **Rendering.** After handling POST the page re-loads `config.php` and `allSettings()`;
 `$eff($key)` shows the effective value (saved overlay → config, arrays joined by `,`).
 Secrets are never echoed back: `$mask()` renders bullets for passwords, `$mask_key()`
