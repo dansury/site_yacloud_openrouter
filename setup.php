@@ -129,39 +129,39 @@ if ($method === 'POST') {
         $cfg_live = require __DIR__ . '/config.php';
         if ((string) $_POST['model_catalog'] === 'forget') {
             ModelCatalog::forget($store);
-            $messages[] = ['ok' => true, 'text' => '✅ Живой каталог забыт — в списках остались вшитые модели.'];
+            $messages[] = ['ok' => true, 'at' => 'catalog', 'text' => '✅ Живой каталог забыт — в списках остались вшитые модели.'];
         } else {
             try {
                 $rep = ModelCatalog::refresh($cfg_live, $store);
-                $messages[] = ['ok' => true, 'text' => '✅ Каталог обновлён: ' . (int) $rep['rows'] . ' моделей'
+                $messages[] = ['ok' => true, 'at' => 'catalog', 'text' => '✅ Каталог обновлён: ' . (int) $rep['rows'] . ' моделей'
                     . ' (OpenRouter: ' . (is_int($rep['openrouter']) ? $rep['openrouter'] : '⛔ ' . $rep['openrouter'])
                     . ', Yandex: ' . (is_int($rep['yandex']) ? $rep['yandex'] : '⛔ ' . $rep['yandex']) . ').'];
             } catch (Throwable $e) {
-                $messages[] = ['ok' => false, 'text' => '⚠️ Каталог моделей не получен: ' . $e->getMessage()];
+                $messages[] = ['ok' => false, 'at' => 'catalog', 'text' => '⚠️ Каталог моделей не получен: ' . $e->getMessage()];
             }
         }
     } elseif (isset($_POST['autopull_check'])) {
         $rep = AutoPull::check($autopull_opts, true);
         $messages[] = $rep['ok']
-            ? ['ok' => true, 'text' => '✅ Автообновление: ' . $rep['note']
+            ? ['ok' => true, 'at' => 'autopull', 'text' => '✅ Автообновление: ' . $rep['note']
                 . ' (head ' . substr($rep['head'], 0, 7) . ').']
-            : ['ok' => false, 'text' => '⚠️ Автообновление: ' . $rep['error']];
+            : ['ok' => false, 'at' => 'autopull', 'text' => '⚠️ Автообновление: ' . $rep['error']];
     } elseif (isset($_POST['smtp_test'])) {
         // Test letter via the CURRENT saved settings (re-read overlay).
         $cfg_live = require __DIR__ . '/config.php';
         $test_to = trim((string) ($_POST['smtp_test_to'] ?? '')) ?: (string) ($cfg_live['ADMIN_EMAIL'] ?? '');
         try {
             Mailer::sendTest($cfg_live, $test_to);
-            $messages[] = ['ok' => true, 'text' => '✅ Тестовое письмо отправлено на ' . $test_to
+            $messages[] = ['ok' => true, 'at' => 'smtp', 'text' => '✅ Тестовое письмо отправлено на ' . $test_to
                 . ' (host=' . ($cfg_live['SMTP_HOST'] ?? '') . ':' . ($cfg_live['SMTP_PORT'] ?? '') . ').'];
         } catch (Throwable $e) {
-            $messages[] = ['ok' => false, 'text' => '⚠️ SMTP-тест не прошёл: ' . $e->getMessage()];
+            $messages[] = ['ok' => false, 'at' => 'smtp', 'text' => '⚠️ SMTP-тест не прошёл: ' . $e->getMessage()];
         }
     } elseif (isset($_POST['llm_probe'])) {
         $cfg_live = require __DIR__ . '/config.php';
         LLM::init($cfg_live, DiagLog::store());
         foreach (LLM::probe() as $leg) {
-            $messages[] = ['ok' => (bool) $leg['ok'], 'text' => ($leg['ok'] ? '✅ ' : '⛔ ')
+            $messages[] = ['ok' => (bool) $leg['ok'], 'at' => 'probe', 'text' => ($leg['ok'] ? '✅ ' : '⛔ ')
                 . $leg['leg'] . ' — ' . $leg['model'] . ': ' . $leg['text']];
         }
     } elseif (isset($_POST['diag_clear'])) {
@@ -322,9 +322,18 @@ if ($vision_cur !== '' && strpos($vision_cur, ':') === false) {
 <h1>site_yacloud_openrouter — настройки <a href="?logout=1" style="font-size:13px;float:right">выйти</a></h1>
 <p class="lede">Заполните только нужные поля — пустые значения не перезаписывают существующие. Значения сразу применяются ко всему сервису (overlay через таблицу <code>settings</code>).</p>
 
-<?php foreach ($messages as $m): ?>
-  <div class="msg <?= $m['ok'] ? 'ok' : 'bad' ?>"><?= $h($m['text']) ?></div>
-<?php endforeach; ?>
+<?php
+// A check's answer is printed under its own button; only the rest goes on top
+$render_msgs = static function (string $at) use ($messages, $h): string {
+    $out = '';
+    foreach ($messages as $m) {
+        if (($m['at'] ?? 'top') !== $at) continue;
+        $out .= '<div class="msg ' . ($m['ok'] ? 'ok' : 'bad') . '">' . $h($m['text']) . '</div>';
+    }
+    return $out;
+};
+echo $render_msgs('top');
+?>
 
 <?php
 /* Self-maintaining layer: the consent question while it is open, the "new
@@ -375,12 +384,13 @@ echo Selfheal\SelfHeal::adminNotice();
     <?php endif; ?>
   </p>
   <label><span>Срок годности кэша каталога, мин</span><input type="text" name="MODEL_CATALOG_TTL_MIN" placeholder="<?= $h((string) $live_ttl) ?>"></label>
-  <div class="row">
-    <button type="submit" name="model_catalog" value="refresh" formnovalidate>Обновить каталог моделей</button>
+  <div class="row" id="catalog">
+    <button type="submit" name="model_catalog" value="refresh" formaction="setup.php#catalog" formnovalidate>Обновить каталог моделей</button>
     <?php if ($live_rows): ?>
-      <button type="submit" name="model_catalog" value="forget" formnovalidate>Забыть живой каталог</button>
+      <button type="submit" name="model_catalog" value="forget" formaction="setup.php#catalog" formnovalidate>Забыть живой каталог</button>
     <?php endif; ?>
   </div>
+  <?= $render_msgs('catalog') ?>
 
   <?php
   // What 'auto' resolves to for the currently chosen model — shown right here,
@@ -498,18 +508,20 @@ echo Selfheal\SelfHeal::adminNotice();
   <p><button type="submit">Сохранить</button></p>
 </form>
 
-<form method="post" autocomplete="off" style="margin-top:18px;">
+<form method="post" action="setup.php#autopull" id="autopull" autocomplete="off" style="margin-top:18px;">
   <h2>Проверить обновление сейчас</h2>
   <p class="lede" style="margin:-4px 0 10px">Спрашивает head у GitHub и, если коммит новее выложенного, запускает <code>pull.php</code> — независимо от галочки выше.</p>
   <p><button type="submit" name="autopull_check" value="1">Проверить и обновить</button></p>
+  <?= $render_msgs('autopull') ?>
 </form>
 
-<form method="post" autocomplete="off" style="margin-top:18px;">
+<form method="post" action="setup.php#probe" id="probe" autocomplete="off" style="margin-top:18px;">
   <h2>Проверка провайдеров</h2>
   <p class="lede">Один короткий запрос к каждой настроенной модели — сразу видно, что именно
     отвечает провайдер: неверный ключ, чужой каталог, модель не включена в облачном каталоге.
     Результат попадает и в лог ниже.</p>
   <p><button type="submit" name="llm_probe" value="1">Проверить модели и ключи</button></p>
+  <?= $render_msgs('probe') ?>
 </form>
 
 <?php
@@ -551,9 +563,10 @@ function diagCopy(id, btn) {
 }
 </script>
 
-<form method="post" autocomplete="off" style="margin-top:18px;">
+<form method="post" action="setup.php#smtp" id="smtp" autocomplete="off" style="margin-top:18px;">
   <h2>Тест SMTP</h2>
   <label><span>Кому отправить тестовое письмо</span><input type="text" name="smtp_test_to" placeholder="<?= $h($eff('ADMIN_EMAIL')) ?>"></label>
   <p><button type="submit" name="smtp_test" value="1">Отправить тестовое письмо</button></p>
+  <?= $render_msgs('smtp') ?>
 </form>
 </body></html>
