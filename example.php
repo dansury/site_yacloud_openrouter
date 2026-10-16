@@ -16,7 +16,7 @@ require_once __DIR__ . '/mailer.php';
 require_once __DIR__ . '/selfheal/bootstrap.php';   // the one line a host needs
 
 $cfg = require __DIR__ . '/config.php';
-LLM::init($cfg);
+ToolkitLLM::init($cfg);
 
 // Self-maintaining layer. Booting it installs chained error handlers and
 // returns; it prints nothing and cannot change how this script behaves.
@@ -31,9 +31,9 @@ $arg  = $argv[2] ?? '';
 switch ($mode) {
     case 'chat':
         // Optional: pick a model / provider for this call.
-        // LLM::setModelOverride('gpt-4o'); LLM::setProviderOverride('openrouter');
+        // ToolkitLLM::setModelOverride('gpt-4o'); ToolkitLLM::setProviderOverride('openrouter');
         try {
-            $text = LLM::chatText('Ты — лаконичный ассистент. Отвечай по-русски.', $arg ?: 'Привет!');
+            $text = ToolkitLLM::chatText('Ты — лаконичный ассистент. Отвечай по-русски.', $arg ?: 'Привет!');
             echo $text . "\n";
         } catch (Throwable $e) {
             // userMessage() = capture() + the mandatory signature: the user is
@@ -44,12 +44,12 @@ switch ($mode) {
 
     case 'ocr':
         // PDF OCR over the configured chain (Yandex Vision + OpenRouter vision).
-        $text = LLM::ocrPdf($arg);
+        $text = ToolkitLLM::ocrPdf($arg);
         echo ($text ?? '(empty)') . "\n";
         break;
 
     case 'parse':
-        // DOCX/PDF → normalized text (PDF falls back to OCR via LLM::ocrPdf).
+        // DOCX/PDF → normalized text (PDF falls back to OCR via ToolkitLLM::ocrPdf).
         $ext = strtolower(pathinfo($arg, PATHINFO_EXTENSION));
         $res = Parser::extract($arg, $ext);
         echo "source={$res['source']} quality={$res['quality']}\n\n";
