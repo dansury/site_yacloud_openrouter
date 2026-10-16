@@ -55,7 +55,7 @@
 
 | File | Modules covered |
 |---|---|
-| `/spec/llm.md`      | `llm.php` — OpenRouter + Yandex providers, overrides, fallback chain, PDF OCR |
+| `/spec/llm.md`      | `llm.php` — OpenRouter + Yandex + GenRouter providers, overrides, fallback chain, PDF OCR |
 | `/spec/model_catalog.md` | `model_catalog.php` — live provider catalogue, cache in `settings`, model versions |
 | `/spec/parser.md`   | `parser.php` — DOCX/PDF extraction, normalization, quality heuristic |
 | `/spec/mailer.md`   | `mailer.php` — SMTP transport, MIME building, attachments, error notifications |
@@ -112,3 +112,5 @@ absent → PDF goes straight to OCR.
 | `dirname(DB_PATH)` | `auto-pull.json` — last deploy check (see `/spec/auto_pull.md` §4) |
 
 Both are gitignored (`data/*.db`, `data/logs/`).
+
+`llm_providers.php` and `provider_controls.js`: shared provider policy and connection-card interaction, specified in `/spec/llm.md`, `/spec/model_catalog.md` and `/spec/settings.md`. `tests/genrouter.php` and `tests/provider_controls.browser.js` verify these contracts.

@@ -1,11 +1,11 @@
 {
   "module": "site_yacloud_openrouter",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "api_version": "1.0.0",
   "repo": "dansury/site_yacloud_openrouter",
   "channel": "main",
   "entry": "selfheal/bootstrap.php",
-  "notes": "Самоподдерживающийся модуль: сбор ошибок, отчёты в issues, обновление с откатом.",
+  "notes": "РЎР°РјРѕРїРѕРґРґРµСЂР¶РёРІР°СЋС‰РёР№СЃСЏ РјРѕРґСѓР»СЊ: СЃР±РѕСЂ РѕС€РёР±РѕРє, РѕС‚С‡С‘С‚С‹ РІ issues, РѕР±РЅРѕРІР»РµРЅРёРµ СЃ РѕС‚РєР°С‚РѕРј.",
   "requires": {
     "php": "7.4.0",
     "ext": [

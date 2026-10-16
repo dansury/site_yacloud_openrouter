@@ -26,6 +26,9 @@ if (!function_exists('cfg_settings_whitelist')) {
     function cfg_settings_whitelist(): array {
         return [
             'LLM_PROVIDER', 'LLM_DEFAULT_MODEL', 'LLM_PROVIDER_PRIORITY',
+            'LLM_ENABLED_OPENROUTER', 'LLM_ENABLED_YANDEX', 'LLM_ENABLED_GENROUTER',
+            'GENROUTER_API_KEY', 'GENROUTER_MODEL', 'GENROUTER_BASE_URL', 'OPENROUTER_URL',
+            'LLM_PROXY', 'LLM_PROXY_AUTH', 'LLM_PROXY_OPENROUTER', 'LLM_PROXY_YANDEX', 'LLM_PROXY_GENROUTER',
             'OPENROUTER_API_KEY', 'LLM_VISION_MODEL', 'LLM_FALLBACK_MODEL',
             'LLM_FALLBACK_MODE', 'LLM_FALLBACK_MODELS',
             // Live model catalogue: cache, refresh stamp, last failure, TTL.
@@ -59,9 +62,22 @@ $config = [
     // provider after the chosen model and its newer versions.
     'LLM_FALLBACK_MODELS'   => cfg_env('LLM_FALLBACK_MODELS', ''),
 
+    // Existing providers retain their enabled state on upgrade.
+    'LLM_ENABLED_OPENROUTER' => cfg_env('LLM_ENABLED_OPENROUTER', '1'),
+    'LLM_ENABLED_YANDEX' => cfg_env('LLM_ENABLED_YANDEX', '1'),
+    'LLM_ENABLED_GENROUTER' => cfg_env('LLM_ENABLED_GENROUTER', '0'),
+    'GENROUTER_API_KEY' => cfg_env('GENROUTER_API_KEY', ''),
+    'GENROUTER_MODEL' => cfg_env('GENROUTER_MODEL', 'anthropic/claude-opus-5'),
+    'GENROUTER_BASE_URL' => cfg_env('GENROUTER_BASE_URL', 'https://api.genrouter.ru/v1'),
+    'LLM_PROXY' => cfg_env('LLM_PROXY', ''),
+    'LLM_PROXY_AUTH' => cfg_env('LLM_PROXY_AUTH', ''),
+    'LLM_PROXY_OPENROUTER' => cfg_env('LLM_PROXY_OPENROUTER', '1'),
+    'LLM_PROXY_YANDEX' => cfg_env('LLM_PROXY_YANDEX', '0'),
+    'LLM_PROXY_GENROUTER' => cfg_env('LLM_PROXY_GENROUTER', '0'),
+
     /* ── OpenRouter ── (supply key via ENV or setup.php) */
     'OPENROUTER_API_KEY'    => cfg_env('OPENROUTER_API_KEY', ''),
-    'OPENROUTER_URL'        => 'https://openrouter.ai/api/v1/chat/completions',
+    'OPENROUTER_URL'        => cfg_env('OPENROUTER_URL', 'https://openrouter.ai/api/v1/chat/completions'),
     'LLM_VISION_MODEL'      => cfg_env('LLM_VISION_MODEL', 'yandex:qwen3.6-35b-a3b'),
     'LLM_FALLBACK_MODEL'    => cfg_env('LLM_FALLBACK_MODEL', 'openrouter/auto'),
     'YANDEX_FALLBACK_MODEL' => cfg_env('YANDEX_FALLBACK_MODEL', 'yandexgpt-5-lite'),
@@ -168,6 +184,7 @@ $config = [
         ['id' => 'qwen3.6-35b-a3b', 'label' => 'Qwen3.6 35B A3B (зрение)', 'provider' => 'yandex', 'full_id' => 'qwen3.6-35b-a3b', 'group' => 'Yandex AI Studio · зрение', 'price_in' => 0.35, 'price_out' => 0.35, 'context' => 262144, 'vision' => true],
         // ── Yandex Vision OCR (PDF text recognition, not a chat model) ──
         ['id' => 'yandex-vision-ocr', 'label' => 'Yandex Vision OCR (PDF)', 'provider' => 'yandex', 'full_id' => 'yandex-ocr-page', 'group' => 'Yandex Vision', 'price_in' => 0.0, 'price_out' => 0.0, 'ocr_only' => true],
+        ['id' => 'genrouter:anthropic/claude-opus-5', 'label' => 'Claude Opus 5 (GenRouter)', 'provider' => 'genrouter', 'full_id' => 'anthropic/claude-opus-5', 'group' => 'GenRouter', 'price_in' => 0.0, 'price_out' => 0.0],
         // ── OpenRouter ──
         ['id' => 'openrouter-deepseek-r1', 'label' => 'DeepSeek R1 (OpenRouter)', 'provider' => 'openrouter', 'full_id' => 'deepseek/deepseek-r1', 'group' => 'OpenRouter', 'price_in' => 50.0, 'price_out' => 200.0, 'vision' => false],
         ['id' => 'gpt-4o',           'label' => 'GPT-4o (OpenRouter)',           'provider' => 'openrouter', 'full_id' => 'openai/gpt-4o',                'group' => 'OpenRouter', 'price_in' => 230.0, 'price_out' => 920.0, 'vision' => true],
@@ -194,7 +211,8 @@ $config = [
         foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) ?: [] as $row) {
             $k = (string) ($row['key'] ?? '');
             $v = (string) ($row['value'] ?? '');
-            if ($v === '' || !in_array($k, $overlayKeys, true)) continue;
+            if (!in_array($k, $overlayKeys, true)) continue;
+            if ($v === '' && !in_array($k, ['LLM_VISION_MODEL', 'LLM_FALLBACK_MODEL', 'YANDEX_FALLBACK_MODEL', 'GENROUTER_MODEL', 'LLM_FALLBACK_MODELS', 'LLM_PROXY'], true)) continue;
             if (in_array($k, $csvKeys, true)) {
                 $config[$k] = array_values(array_filter(array_map('trim', explode(',', $v))));
             } elseif (in_array($k, $intKeys, true)) {

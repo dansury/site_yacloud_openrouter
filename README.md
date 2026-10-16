@@ -52,7 +52,7 @@ no TZ citations. Specs live in [`spec.md`](spec.md) + `spec/`.
 > php tests/selfheal_smoke.php # изоляция и контракт — проверяются тестами
 > ```
 
-- **OpenRouter + Yandex providers & models** (`llm.php`) — two providers behind one
+- **OpenRouter + Yandex + GenRouter providers & models** (`llm.php`) — three providers behind one
   interface, per-session model/provider override, config-driven fallback chain
   (a newer version of the same model first, then the operator's list, then the
   per-provider fallbacks), generic `chatText()` / `chatJson()`.
@@ -111,7 +111,9 @@ reading do not find it. It is sealed, not secret — see `selfheal/Vault.php`.
 site_yacloud_openrouter/
 ├── config.php          # config: ENV + settings-table overlay, AVAILABLE_MODELS
 ├── model_catalog.php   # ModelCatalog — live provider catalogue, cache, model versions
-├── llm.php             # LLM class — OpenRouter + Yandex, fallback, PDF OCR
+├── llm.php             # ToolkitLLM — OpenRouter + Yandex + GenRouter, fallback, PDF OCR
+├── llm_providers.php   # shared enable/disable and per-provider proxy policy
+├── provider_controls.js # immediate connection-card saves without losing edits
 ├── parser.php          # Parser class — DOCX/PDF extraction + normalization
 ├── mailer.php          # Mailer class — SMTP send (custom/attachment/test/error)
 ├── settings_store.php  # SettingsStore — key/value SQLite store
@@ -253,3 +255,13 @@ fails, `LLM_FALLBACK_MODE=auto` reaches for a **newer version of the same model*
 (`claude-sonnet-4` → `claude-sonnet-4.5`), so a refreshed catalogue keeps the backup
 current on its own. Models whose slug carries no readable version (`yandexgpt`, `gpt-4o`)
 fall through to `LLM_FALLBACK_MODELS`, which is also what `manual` mode uses exclusively.
+
+## GenRouter and connection controls
+
+Connection behavior is adapted from [kp-atlant module 070](https://github.com/dansury/kp-atlant/blob/17d460419ec5edf8f279513acb96f68d7c0ba6ee/specs/070-genrouter-provider-controls/spec.md): independent Bearer key and API address, live model IDs (including plain slugs), separate proxy switches, provider enable/disable cards and connection tests. Its application-specific mail automation and CRM dependencies are not imported.
+
+Open `setup.php`, enable GenRouter on its card, enter the API key and save, then refresh models and select a model from the live catalog. Save the card and use the global default-model and priority controls to choose the generation order. A disabled provider preserves its saved key, model and catalog. Card switches save immediately and preserve other unsaved edits. Tests and refreshes use saved settings. Existing OpenRouter/Yandex integrations remain enabled on upgrade; GenRouter starts disabled. No real provider request is required for the regression tests.
+
+ENV-only configuration can set `LLM_ENABLED_GENROUTER=1`, `GENROUTER_API_KEY`, `GENROUTER_MODEL`, `LLM_PROVIDER=genrouter`, `LLM_DEFAULT_MODEL=genrouter:<exact-model-id>` and `LLM_PROVIDER_PRIORITY=genrouter,openrouter,yandex`. `GENROUTER_BASE_URL` defaults to `https://api.genrouter.ru/v1`. Shared proxy credentials (`LLM_PROXY`, `LLM_PROXY_AUTH`) apply only when that provider's `LLM_PROXY_<PROVIDER>` switch is on.
+
+Run `php tests/genrouter.php` for local mock-API coverage of text, JSON, images, parallel requests, probes, fallback, cache retention, exact IDs, pricing, proxy policy and disabled-provider isolation. Run the other `tests/*.php` scripts separately for the existing regression suite (fixture routers are not standalone tests). Browser regression: serve the module with a disposable database, local mock provider endpoints and `SELFHEAL_REPORTING=off`; log into its local setup page with Playwright CLI, then run `playwright-cli run-code --filename tests/provider_controls.browser.js`. The browser fixture expects a local GenRouter catalog containing `vendor/test`, `plain-model` and `vendor/free` from `tests/fixtures/providers.php`; it checks persistence, retained edits, refresh, connection tests, failed-save rollback, masking, CSRF and desktop/mobile layouts.

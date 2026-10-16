@@ -33,6 +33,8 @@ DiagLog::init((string) $cfg['DB_PATH'], DiagLog::codeStamp([
     __DIR__ . '/setup.php', __DIR__ . '/parser.php', __DIR__ . '/mailer.php',
 ]));
 DiagLog::addSecret((string) ($cfg['OPENROUTER_API_KEY'] ?? ''));
+DiagLog::addSecret((string) ($cfg['GENROUTER_API_KEY'] ?? ''));
+DiagLog::addSecret((string) ($cfg['LLM_PROXY_AUTH'] ?? ''));
 DiagLog::addSecret((string) ($cfg['YANDEX_API_KEY'] ?? ''));
 DiagLog::addSecret((string) ($cfg['SMTP_PASS'] ?? ''));
 DiagLog::addSecret((string) ($cfg['ADMIN_PASSWORD'] ?? ''));
@@ -45,6 +47,7 @@ Selfheal\SelfHeal::boot([
     'app'     => 'site_yacloud_openrouter/setup.php',
     'secrets' => [
         (string) ($cfg['OPENROUTER_API_KEY'] ?? ''), (string) ($cfg['YANDEX_API_KEY'] ?? ''),
+        (string) ($cfg['GENROUTER_API_KEY'] ?? ''), (string) ($cfg['LLM_PROXY_AUTH'] ?? ''),
         (string) ($cfg['SMTP_PASS'] ?? ''), (string) ($cfg['ADMIN_PASSWORD'] ?? ''),
     ],
 ]);
@@ -99,6 +102,70 @@ if (!$hostAuthenticated && empty($_SESSION['admin_authed'])) {
     exit;
 }
 
+// All connection controls share the authenticated session's CSRF nonce.
+if (empty($_SESSION['toolkit_csrf'])) $_SESSION['toolkit_csrf'] = bin2hex(random_bytes(24));
+$csrf = (string) $_SESSION['toolkit_csrf'];
+if (isset($_POST['provider_action'])) {
+    header('Content-Type: application/json; charset=utf-8');
+    try {
+        if (!hash_equals($csrf, (string) ($_POST['csrf'] ?? ''))) throw new RuntimeException('Обновите страницу и повторите действие');
+        $provider = (string) ($_POST['provider'] ?? '');
+        if (!isset(LLMProviders::LABELS[$provider])) throw new RuntimeException('Неизвестный провайдер');
+        $action = (string) $_POST['provider_action'];
+        if (in_array($action, ['toggle', 'save'], true)) $store->pdo()->beginTransaction();
+        $modelKey = ['openrouter' => 'LLM_FALLBACK_MODEL', 'yandex' => 'YANDEX_FALLBACK_MODEL', 'genrouter' => 'GENROUTER_MODEL'][$provider];
+        if ($action === 'toggle') {
+            $enabled = ($_POST['enabled'] ?? '') === '1';
+            $store->setSetting('LLM_ENABLED_' . strtoupper($provider), $enabled ? '1' : '0');
+            if ($enabled) {
+                $order = array_values(array_filter(array_map('trim', explode(',', (string) $cfg['LLM_PROVIDER_PRIORITY']))));
+                if (!in_array($provider, $order, true)) $order[] = $provider;
+                $store->setSetting('LLM_PROVIDER_PRIORITY', implode(',', $order));
+            }
+            $note = $enabled ? 'Включён' : 'Выключен';
+        } else {
+            LLMProviders::requireEnabled($cfg, $provider);
+            if ($action === 'save') {
+                $keys = [strtoupper($provider) . '_API_KEY', $modelKey];
+                if ($provider === 'genrouter') $keys[] = 'GENROUTER_BASE_URL';
+                if ($provider === 'openrouter') $keys[] = 'OPENROUTER_URL';
+                if ($provider === 'yandex') $keys[] = 'YANDEX_FOLDER_ID';
+                foreach ($keys as $key) {
+                    if (!isset($_POST[$key])) continue;
+                    $value = trim((string) $_POST[$key]);
+                    if ($value !== '' || $key === $modelKey) $store->setSetting($key, $value);
+                }
+                $store->setSetting('LLM_PROXY_' . strtoupper($provider), isset($_POST['use_proxy']) ? '1' : '0');
+                $note = 'Настройки сохранены';
+            } elseif ($action === 'refresh') {
+                $report = ModelCatalog::refresh($cfg, $store, $provider);
+                $note = 'Каталог обновлён: ' . $report[$provider] . ' моделей';
+            } elseif ($action === 'forget') {
+                ModelCatalog::forget($store, $provider);
+                $note = 'Каталог сброшен';
+            } elseif ($action === 'test') {
+                ToolkitLLM::init($cfg, DiagLog::store());
+                ToolkitLLM::setProviderOverride($provider);
+                ToolkitLLM::setModelOverride($provider . ':' . (string) ($cfg[$modelKey] ?? ''));
+                $legs = ToolkitLLM::probe($provider);
+                $leg = $legs[0] ?? ['ok' => false, 'text' => 'Модель не выбрана'];
+                if (!$leg['ok']) throw new RuntimeException((string) $leg['text']);
+                $note = (string) $leg['text'];
+            } else {
+                throw new RuntimeException('Неизвестное действие');
+            }
+        }
+        if ($store->pdo()->inTransaction()) $store->pdo()->commit();
+        $fresh = require __DIR__ . '/config.php';
+        echo json_encode(['ok' => true, 'note' => $note, 'models' => $fresh['AVAILABLE_MODELS']], JSON_UNESCAPED_UNICODE);
+    } catch (Throwable $e) {
+        if ($store->pdo()->inTransaction()) $store->pdo()->rollBack();
+        echo json_encode(['ok' => false, 'note' => Selfheal\SelfHeal::userMessage($e,
+            'Не удалось выполнить действие. ' . DiagLog::redact($e->getMessage()))], JSON_UNESCAPED_UNICODE);
+    }
+    exit;
+}
+
 // Auto-pull options: the switch lives in `settings`, the credentials in
 // pull-config.php next to pull.php. The state file goes to the data directory —
 // the web root is what a deploy overwrites.
@@ -119,11 +186,14 @@ if (is_array($selfheal_result)) {
         'text' => (!empty($selfheal_result['ok']) ? '✅ Модуль: ' : '⚠️ Модуль: ') . (string) ($selfheal_result['note'] ?? '')];
 }
 
-if ($method === 'POST') {
+if ($method === 'POST' && $selfheal_result === null && !hash_equals($csrf, (string) ($_POST['csrf'] ?? ''))) {
+    http_response_code(403);
+    $messages[] = ['ok' => false, 'text' => 'Сессия формы устарела. Обновите страницу.'];
+} elseif ($method === 'POST' && $selfheal_result === null) {
     if (isset($_POST['model_catalog'])) {
         // Keys just typed into the form are saved before the fetch — otherwise
         // the catalogue would be pulled with the previous credentials.
-        foreach (['OPENROUTER_API_KEY', 'YANDEX_API_KEY', 'YANDEX_FOLDER_ID'] as $k) {
+        foreach (['OPENROUTER_API_KEY', 'YANDEX_API_KEY', 'YANDEX_FOLDER_ID', 'GENROUTER_API_KEY'] as $k) {
             $v = trim((string) ($_POST[$k] ?? ''));
             if ($v !== '') $store->setSetting($k, $v);
         }
@@ -135,8 +205,9 @@ if ($method === 'POST') {
             try {
                 $rep = ModelCatalog::refresh($cfg_live, $store);
                 $messages[] = ['ok' => true, 'at' => 'catalog', 'text' => '✅ Каталог обновлён: ' . (int) $rep['rows'] . ' моделей'
-                    . ' (OpenRouter: ' . (is_int($rep['openrouter']) ? $rep['openrouter'] : '⛔ ' . $rep['openrouter'])
-                    . ', Yandex: ' . (is_int($rep['yandex']) ? $rep['yandex'] : '⛔ ' . $rep['yandex']) . ').'];
+                    . ' (OpenRouter: ' . (is_int($rep['openrouter']) ? $rep['openrouter'] : ($rep['openrouter'] === null ? 'выключен' : '⛔ ' . $rep['openrouter']))
+                    . ', Yandex: ' . (is_int($rep['yandex']) ? $rep['yandex'] : ($rep['yandex'] === null ? 'выключен' : '⛔ ' . $rep['yandex']))
+                    . ', GenRouter: ' . (is_int($rep['genrouter']) ? $rep['genrouter'] : ($rep['genrouter'] === null ? 'выключен' : '⛔ ' . $rep['genrouter'])) . ').'];
             } catch (Throwable $e) {
                 $messages[] = ['ok' => false, 'at' => 'catalog', 'text' => '⚠️ Каталог моделей не получен: ' . $e->getMessage()];
             }
@@ -188,6 +259,7 @@ if ($method === 'POST') {
             'LLM_FALLBACK_MODE', 'MODEL_CATALOG_TTL_MIN', 'LLM_MAX_TOKENS',
             'LLM_OCR_MODELS', 'YANDEX_OCR_MODEL',
             'OPENROUTER_API_KEY', 'YANDEX_API_KEY', 'YANDEX_FOLDER_ID',
+            'LLM_PROXY_AUTH',
             'ADMIN_EMAIL', 'ERROR_EMAIL',
             'SMTP_HOST', 'SMTP_PORT', 'SMTP_USER', 'SMTP_PASS', 'SMTP_FROM', 'SMTP_FROM_NAME',
             'ADMIN_PASSWORD',
@@ -203,6 +275,7 @@ if ($method === 'POST') {
             $store->setSetting($k, trim((string) $_POST[$k]));
             $edited[] = $k;
         }
+        if (isset($_POST['LLM_PROXY'])) $store->setSetting('LLM_PROXY', trim((string) $_POST['LLM_PROXY']));
         // Auto-pull: the checkbox and its two knobs are always written, so both
         // «выключить» and «очистить адрес» actually take effect.
         $store->setSetting('AUTOPULL_ENABLED', isset($_POST['AUTOPULL_ENABLED']) ? '1' : '0');
@@ -221,10 +294,11 @@ if ($method === 'POST') {
 // MODEL_CATALOG_TTL_MIN minutes is refetched from the providers, otherwise
 // nothing happens. A network failure never breaks the page — the previous list
 // stays and the reason is rendered below.
-ModelCatalog::maybeRefresh(require __DIR__ . '/config.php', $store);
+if (($_POST['model_catalog'] ?? '') !== 'forget') ModelCatalog::maybeRefresh(require __DIR__ . '/config.php', $store);
 
 // Re-load config so freshly-saved overlay values render in the "current" hints.
 $cfg = require __DIR__ . '/config.php';
+foreach (['OPENROUTER_API_KEY', 'YANDEX_API_KEY', 'GENROUTER_API_KEY', 'LLM_PROXY_AUTH'] as $secretKey) DiagLog::addSecret((string) ($cfg[$secretKey] ?? ''));
 $current = $store->allSettings();
 $mask = static fn (?string $v) => $v ? str_repeat('•', max(4, min(strlen((string) $v), 16))) : '';
 $mask_key = static function (?string $v): string {
@@ -247,7 +321,7 @@ ToolkitLLM::init($cfg, DiagLog::store());
 // catalogue (hardcoded rows + what the providers reported).
 $groups = [];
 foreach ((array) ($cfg['AVAILABLE_MODELS'] ?? []) as $mdl) {
-    if (empty($mdl['ocr_only'])) $groups[(string) ($mdl['group'] ?? 'Модели')][] = $mdl;
+    if (empty($mdl['ocr_only']) && LLMProviders::enabled($cfg, (string) $mdl['provider'])) $groups[(string) ($mdl['group'] ?? 'Модели')][] = $mdl;
 }
 // Price hint: RUB per 1k for hardcoded rows, USD per 1M for live ones (that is
 // how the provider reports it — no invented exchange rate).
@@ -266,7 +340,7 @@ $price = static function (array $m): string {
  * its own option: otherwise the browser would pick the first row and saving
  * would silently swap the model.
  */
-$model_select = static function (string $name, string $current, callable $value, ?callable $filter = null, string $empty = '') use ($groups, $price, $h): string {
+$model_select = static function (string $name, string $current, callable $value, ?callable $filter = null, string $empty = '') use ($groups, $price, $h, $cfg): string {
     $html = '<select name="' . $h($name) . '">';
     if ($empty !== '') {
         $html .= '<option value=""' . ($current === '' ? ' selected' : '') . '>' . $h($empty) . '</option>';
@@ -280,13 +354,19 @@ $model_select = static function (string $name, string $current, callable $value,
         foreach ($rows as $mdl) {
             $val = (string) $value($mdl);
             if ($val === $current) $known = true;
-            $body .= '<option value="' . $h($val) . '"' . ($val === $current ? ' selected' : '') . '>'
+            $body .= '<option data-provider="' . $h((string) $mdl['provider']) . '" value="' . $h($val) . '"' . ($val === $current ? ' selected' : '') . '>'
                 . $h((string) $mdl['label']) . ' — ' . $h((string) $mdl['provider']) . '/' . $h((string) $mdl['full_id'])
                 . $h($price($mdl)) . '</option>';
         }
         $body .= '</optgroup>';
     }
-    if ($current !== '' && !$known) {
+    $savedRow = ToolkitLLM::findModel($current) ?? ToolkitLLM::resolveModelSpec($current);
+    $savedEnabled = $savedRow === null || LLMProviders::enabled($cfg, (string) $savedRow['provider']);
+    $savedProvider = $name === 'GENROUTER_MODEL' ? 'genrouter' : (string) ($savedRow['provider'] ?? '');
+    $authoritative = $savedProvider === 'genrouter' && count(array_filter($cfg['AVAILABLE_MODELS'], static function ($r) {
+        return ($r['provider'] ?? '') === 'genrouter' && !empty($r['live']);
+    })) > 0;
+    if ($current !== '' && !$known && $savedEnabled && !$authoritative) {
         $html .= '<option value="' . $h($current) . '" selected>' . $h($current) . ' — нет в каталоге</option>';
     }
     return $html . $body . '</select>';
@@ -319,6 +399,18 @@ if ($vision_cur !== '' && strpos($vision_cur, ':') === false) {
   .msg.ok { border-color: #1f6f4f; } .msg.bad { border-color: #ff4560; }
   .row { display: flex; gap: 12px; } .row > * { flex: 1; }
   a { color: #00d4e8; }
+[hidden] { display:none !important; }
+.provider-cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,280px),1fr)); gap:16px; }
+.provider-card { min-width:0; border:1px solid #344057; border-radius:8px; padding:16px; }
+.provider-card fieldset { border:0; padding:0; min-width:0; }
+.provider-switch { display:flex; gap:8px; align-items:center; }
+.provider-switch input { width:auto; }
+.provider-actions { display:flex; flex-wrap:wrap; gap:8px; }
+.provider-status { min-height:1.5em; overflow-wrap:anywhere; }
+input,select,textarea { box-sizing:border-box; max-width:100%; }
+.row { flex-wrap:wrap; }
+.row > * { min-width:0; }
+@media (max-width:480px) { .row > label { flex-basis:100%; } }
 </style></head><body>
 <h1>site_yacloud_openrouter — настройки <a href="?logout=1" style="font-size:13px;float:right">выйти</a></h1>
 <p class="lede">Заполните только нужные поля — пустые значения не перезаписывают существующие. Значения сразу применяются ко всему сервису (overlay через таблицу <code>settings</code>).</p>
@@ -343,22 +435,52 @@ echo $render_msgs('top');
 echo Selfheal\SelfHeal::adminNotice();
 ?>
 
+<h2>Подключения нейросетей</h2>
+<div class="provider-cards">
+<?php foreach (LLMProviders::LABELS as $provider => $label):
+    $enabled = LLMProviders::enabled($cfg, $provider);
+    $key = strtoupper($provider) . '_API_KEY';
+    $modelKey = ['openrouter' => 'LLM_FALLBACK_MODEL', 'yandex' => 'YANDEX_FALLBACK_MODEL', 'genrouter' => 'GENROUTER_MODEL'][$provider];
+?>
+<form method="post" class="provider-card" data-provider="<?= $h($provider) ?>">
+  <input type="hidden" name="csrf" value="<?= $h($csrf) ?>">
+  <input type="hidden" name="provider" value="<?= $h($provider) ?>">
+  <label class="provider-switch"><input type="checkbox" name="enabled" value="1" <?= $enabled ? 'checked' : '' ?>> Использовать <?= $h($label) ?></label>
+  <p role="status" aria-live="polite" class="provider-status"></p>
+  <fieldset data-provider-controls="<?= $h($provider) ?>" <?= $enabled ? '' : 'hidden' ?>>
+    <label><span>API-ключ · <a href="<?= $h(['openrouter' => 'https://openrouter.ai/settings/keys', 'genrouter' => 'https://genrouter.ru/', 'yandex' => 'https://console.yandex.cloud/'][$provider]) ?>" target="_blank" rel="noopener">Личный кабинет</a></span><input type="password" name="<?= $h($key) ?>" placeholder="<?= $h($mask_key($eff($key))) ?>"></label>
+    <label><span>Модель провайдера</span><?= $model_select($modelKey, $eff($modelKey), static function ($m) { return (string) $m['full_id']; }, static function ($m) use ($provider) { return $m['provider'] === $provider; }, '— выберите модель —') ?></label>
+    <?php if ($provider === 'genrouter'): ?><label><span>Адрес API</span><input type="url" name="GENROUTER_BASE_URL" value="<?= $h($eff('GENROUTER_BASE_URL')) ?>"></label><?php endif; ?>
+    <?php if ($provider === 'openrouter'): ?><label><span>Адрес API</span><input type="url" name="OPENROUTER_URL" value="<?= $h($eff('OPENROUTER_URL')) ?>"></label><?php endif; ?>
+    <?php if ($provider === 'yandex'): ?><label><span>Folder ID</span><input type="text" name="YANDEX_FOLDER_ID" value="<?= $h($eff('YANDEX_FOLDER_ID')) ?>"></label><?php endif; ?>
+    <label class="provider-switch"><input type="checkbox" name="use_proxy" value="1" <?= $eff('LLM_PROXY_' . strtoupper($provider)) === '1' ? 'checked' : '' ?>> Использовать общий прокси</label>
+    <div class="provider-actions">
+      <button name="provider_action" value="save">Сохранить</button>
+      <button name="provider_action" value="test">Проверить соединение</button>
+      <button name="provider_action" value="refresh">Обновить модели</button>
+      <button name="provider_action" value="forget">Сбросить каталог</button>
+    </div>
+  </fieldset>
+</form>
+<?php endforeach; ?>
+</div>
+
 <form method="post" autocomplete="off">
   <input type="hidden" name="action" value="save">
+  <input type="hidden" name="csrf" value="<?= $h($csrf) ?>">
 
   <h2>Провайдер и модели</h2>
   <div class="row">
     <label><span>Провайдер по умолчанию</span>
       <select name="LLM_PROVIDER">
-        <option value="openrouter" <?= $eff('LLM_PROVIDER') === 'openrouter' ? 'selected' : '' ?>>openrouter (fallback → yandex)</option>
-        <option value="yandex" <?= $eff('LLM_PROVIDER') === 'yandex' ? 'selected' : '' ?>>yandex</option>
+        <?php foreach (LLMProviders::LABELS as $provider => $label): if (!LLMProviders::enabled($cfg, $provider)) continue; ?>
+        <option data-provider="<?= $h($provider) ?>" value="<?= $h($provider) ?>" <?= $eff('LLM_PROVIDER') === $provider ? 'selected' : '' ?>><?= $h($label) ?></option>
+        <?php endforeach; ?>
       </select>
     </label>
     <label><span>Приоритет провайдеров</span>
-      <select name="LLM_PROVIDER_PRIORITY">
-        <option value="openrouter,yandex" <?= $eff('LLM_PROVIDER_PRIORITY') === 'openrouter,yandex' ? 'selected' : '' ?>>openrouter → yandex</option>
-        <option value="yandex,openrouter" <?= $eff('LLM_PROVIDER_PRIORITY') === 'yandex,openrouter' ? 'selected' : '' ?>>yandex → openrouter</option>
-      </select>
+      <input type="text" name="LLM_PROVIDER_PRIORITY" value="<?= $h($eff('LLM_PROVIDER_PRIORITY')) ?>" placeholder="genrouter,openrouter,yandex">
+
     </label>
   </div>
   <label><span>Модель по умолчанию (каталог: вшитый список + то, что отдал провайдер)</span>
@@ -422,14 +544,8 @@ echo Selfheal\SelfHeal::adminNotice();
       </label>
     <?php endfor; ?>
   </div>
-  <label><span>Vision-модель: фото, этикетки и страницы PDF (OpenRouter и Yandex — только модели со зрением)</span>
+  <label><span>Vision-модель: фото, этикетки и страницы PDF (OpenRouter, GenRouter и Yandex — только модели со зрением)</span>
     <?= $model_select('LLM_VISION_MODEL', $vision_cur, $by_slug, $only_vision, '— не задана (значение из config.php) —') ?>
-  </label>
-  <label><span>OpenRouter fallback-модель (последняя попытка на этом провайдере)</span>
-    <?= $model_select('LLM_FALLBACK_MODEL', $eff('LLM_FALLBACK_MODEL'), static function (array $m): string { return (string) $m['full_id']; }, static function (array $m): bool { return ($m['provider'] ?? '') === 'openrouter'; }, '— не задана —') ?>
-  </label>
-  <label><span>Yandex fallback-модель (full_id без gpt://, последняя попытка на этом провайдере)</span>
-    <?= $model_select('YANDEX_FALLBACK_MODEL', $eff('YANDEX_FALLBACK_MODEL'), static function (array $m): string { return (string) $m['full_id']; }, static function (array $m): bool { return ($m['provider'] ?? '') === 'yandex'; }, '— не задана —') ?>
   </label>
   <p class="lede" style="margin:-4px 0 8px">
     Модель, которой нет в живом каталоге провайдера, в запасные не подставляется: слепой запрос к ней
@@ -442,18 +558,16 @@ echo Selfheal\SelfHeal::adminNotice();
     Поднимать это число стоит тогда, когда в логе появляется «ответ оборвался по пределу длины»:
     оборванный ответ никогда не разбирается как JSON.
   </p>
-  <label><span>OCR-модели OpenRouter (через запятую, по порядку)</span><input type="text" name="LLM_OCR_MODELS" placeholder="<?= $h($ocr_models_eff ?: 'google/gemini-2.5-flash,google/gemini-2.0-flash-001') ?>"></label>
-  <label><span>Yandex Vision OCR модель</span><input type="text" name="YANDEX_OCR_MODEL" placeholder="<?= $h($eff('YANDEX_OCR_MODEL') ?: 'page') ?>"></label>
-  <label style="display:flex;align-items:center;gap:8px;">
+  <div data-provider-controls="openrouter" <?= LLMProviders::enabled($cfg, 'openrouter') ? '' : 'hidden' ?>><label><span>OCR-модели OpenRouter (через запятую, по порядку)</span><input type="text" name="LLM_OCR_MODELS" placeholder="<?= $h($ocr_models_eff ?: 'google/gemini-2.5-flash,google/gemini-2.0-flash-001') ?>"></label></div>
+  <div data-provider-controls="yandex" <?= LLMProviders::enabled($cfg, 'yandex') ? '' : 'hidden' ?>><label><span>Yandex Vision OCR модель</span><input type="text" name="YANDEX_OCR_MODEL" placeholder="<?= $h($eff('YANDEX_OCR_MODEL') ?: 'page') ?>"></label></div>
+  <label data-provider-controls="yandex" <?= LLMProviders::enabled($cfg, 'yandex') ? '' : 'hidden' ?> style="display:flex;align-items:center;gap:8px;">
     <input type="checkbox" name="YANDEX_OCR_ENABLED" value="1" style="width:auto;" <?= $eff('YANDEX_OCR_ENABLED') === '1' ? 'checked' : '' ?>>
     <span style="margin:0;">Включить Yandex Vision OCR в цепочку PDF-распознавания</span>
   </label>
 
-  <h2>API-ключи</h2>
-  <label><span>OpenRouter API Key</span><input type="password" name="OPENROUTER_API_KEY" placeholder="<?= $h($mask_key($eff('OPENROUTER_API_KEY'))) ?>"></label>
-  <label><span>Yandex API Key</span><input type="password" name="YANDEX_API_KEY" placeholder="<?= $h($mask_key($eff('YANDEX_API_KEY'))) ?>"></label>
-  <label><span>Yandex Folder ID</span><input type="text" name="YANDEX_FOLDER_ID" placeholder="<?= $h($eff('YANDEX_FOLDER_ID')) ?>"></label>
-
+  <h2>Прокси</h2>
+  <label><span>Общий адрес прокси (необязательно)</span><input type="text" name="LLM_PROXY" value="<?= $h($eff('LLM_PROXY')) ?>" placeholder="http://proxy.example:3128"></label>
+  <label><span>Логин:пароль прокси</span><input type="password" name="LLM_PROXY_AUTH" placeholder="<?= $h($mask($eff('LLM_PROXY_AUTH'))) ?>"></label>
   <h2>Почта (SMTP)</h2>
   <div class="row">
     <label><span>SMTP host</span><input type="text" name="SMTP_HOST" placeholder="<?= $h($eff('SMTP_HOST') ?: 'smtp.yandex.ru') ?>"></label>
@@ -550,7 +664,7 @@ $diag_errors = DiagLog::asText(DiagLog::tail(400, true), $diag_header, 'site_yac
 <div class="row" style="margin-bottom:10px;">
   <button type="button" onclick="diagCopy('diag-full', this)">Скопировать полный лог</button>
   <button type="button" onclick="diagCopy('diag-errors', this)">Скопировать только ошибки</button>
-  <form method="post" style="flex:1;margin:0;"><button type="submit" name="diag_clear" value="1" style="width:100%">Очистить лог</button></form>
+  <form method="post" style="flex:1;margin:0;"><input type="hidden" name="csrf" value="<?= $h($csrf) ?>"><button type="submit" name="diag_clear" value="1" style="width:100%">Очистить лог</button></form>
 </div>
 <label><span>Только ошибки</span><textarea id="diag-errors" readonly rows="10" style="width:100%;font:12px/1.45 ui-monospace,Menlo,Consolas,monospace;background:#131a26;color:#edf1f7;border:1px solid #1f2735;padding:9px 11px;"><?= $h($diag_errors) ?></textarea></label>
 <label><span>Полный лог</span><textarea id="diag-full" readonly rows="16" style="width:100%;font:12px/1.45 ui-monospace,Menlo,Consolas,monospace;background:#131a26;color:#edf1f7;border:1px solid #1f2735;padding:9px 11px;"><?= $h($diag_full) ?></textarea></label>
@@ -565,9 +679,11 @@ function diagCopy(id, btn) {
 </script>
 
 <form method="post" action="setup.php#smtp" id="smtp" autocomplete="off" style="margin-top:18px;">
+  <input type="hidden" name="csrf" value="<?= $h($csrf) ?>">
   <h2>Тест SMTP</h2>
   <label><span>Кому отправить тестовое письмо</span><input type="text" name="smtp_test_to" placeholder="<?= $h($eff('ADMIN_EMAIL')) ?>"></label>
   <p><button type="submit" name="smtp_test" value="1">Отправить тестовое письмо</button></p>
   <?= $render_msgs('smtp') ?>
 </form>
+<script src="provider_controls.js"></script>
 </body></html>
