@@ -127,6 +127,8 @@ via `hash_equals` and only when that value is non-empty (empty admin password â†
 impossible, never open). `?logout=1` clears the session. Unauthenticated requests get
 the login form and `exit`.
 
+**Authenticated embedding.** A host may define `SITE_TOOLKIT_HOST_AUTHENTICATED` as the boolean `true` after performing its own authentication. This request-local constant bypasses only the standalone login gate, never writes `admin_authed` into the shared session, and cannot be set by a query or form parameter. The host must enforce CSRF on embedded POST requests and preserve the module's own capability nonce for self-maintenance actions.
+
 **Save** (`POST action=save`, default action): each whitelisted string field is trimmed
 and written through `setSetting` **only when non-empty** â€” blanks never overwrite an
 existing value (that is what lets the masked key/password placeholders work).

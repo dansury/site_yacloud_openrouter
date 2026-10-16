@@ -36,7 +36,7 @@ DiagLog::addSecret((string) ($cfg['OPENROUTER_API_KEY'] ?? ''));
 DiagLog::addSecret((string) ($cfg['YANDEX_API_KEY'] ?? ''));
 DiagLog::addSecret((string) ($cfg['SMTP_PASS'] ?? ''));
 DiagLog::addSecret((string) ($cfg['ADMIN_PASSWORD'] ?? ''));
-LLM::init($cfg, DiagLog::store());
+ToolkitLLM::init($cfg, DiagLog::store());
 
 // Self-maintaining layer: error reports to the canonical repo (only with the
 // operator's consent), update notice with «Обновить» / «Откатить». Booting it
@@ -73,7 +73,8 @@ if (($_GET['logout'] ?? '') !== '') {
 
 $h = static fn (string $s) => htmlspecialchars($s, ENT_QUOTES, 'UTF-8');
 
-if (empty($_SESSION['admin_authed'])) {
+$hostAuthenticated = defined('SITE_TOOLKIT_HOST_AUTHENTICATED') && SITE_TOOLKIT_HOST_AUTHENTICATED === true;
+if (!$hostAuthenticated && empty($_SESSION['admin_authed'])) {
     ?><!doctype html><html lang="ru"><head><meta charset="utf-8">
     <meta name="robots" content="noindex, nofollow">
     <title>site_yacloud_openrouter — setup (вход)</title>
@@ -159,8 +160,8 @@ if ($method === 'POST') {
         }
     } elseif (isset($_POST['llm_probe'])) {
         $cfg_live = require __DIR__ . '/config.php';
-        LLM::init($cfg_live, DiagLog::store());
-        foreach (LLM::probe() as $leg) {
+        ToolkitLLM::init($cfg_live, DiagLog::store());
+        foreach (ToolkitLLM::probe() as $leg) {
             $messages[] = ['ok' => (bool) $leg['ok'], 'at' => 'probe', 'text' => ($leg['ok'] ? '✅ ' : '⛔ ')
                 . $leg['leg'] . ' — ' . $leg['model'] . ': ' . $leg['text']];
         }
@@ -239,7 +240,7 @@ $eff = static function (string $k) use ($cfg, $current): string {
 };
 $ocr_models_eff = $eff('LLM_OCR_MODELS');
 
-LLM::init($cfg, DiagLog::store());
+ToolkitLLM::init($cfg, DiagLog::store());
 
 // ── Model dropdowns ──────────────────────────────────────────────────────
 // Nobody types a slug: every model field is a <select> built from the same
@@ -299,7 +300,7 @@ $fallback_picked = array_values(array_filter(array_map('trim', explode(',', $eff
 // would render as «нет в каталоге».
 $vision_cur = $eff('LLM_VISION_MODEL');
 if ($vision_cur !== '' && strpos($vision_cur, ':') === false) {
-    $vision_row = LLM::resolveModelSpec($vision_cur);
+    $vision_row = ToolkitLLM::resolveModelSpec($vision_cur);
     if ($vision_row !== null) $vision_cur = $vision_row['provider'] . ':' . $vision_row['full_id'];
 }
 ?><!doctype html><html lang="ru"><head><meta charset="utf-8">
@@ -395,8 +396,8 @@ echo Selfheal\SelfHeal::adminNotice();
   <?php
   // What 'auto' resolves to for the currently chosen model — shown right here,
   // because an irregular slug (yandexgpt, gpt-4o) carries no readable version.
-  LLM::init($cfg);
-  $auto_rows = LLM::autoFallbackRows($model_cur);
+  ToolkitLLM::init($cfg);
+  $auto_rows = ToolkitLLM::autoFallbackRows($model_cur);
   ?>
   <label style="margin-top:14px"><span>Запасная модель: что пробовать после выбранной</span>
     <select name="LLM_FALLBACK_MODE">
@@ -536,7 +537,7 @@ $diag_header = [
         . '; Yandex: ' . ($eff('YANDEX_API_KEY') !== '' ? DiagLog::maskKey($eff('YANDEX_API_KEY')) : 'НЕ ЗАДАН')
         . '; folder: ' . ($eff('YANDEX_FOLDER_ID') !== '' ? $eff('YANDEX_FOLDER_ID') : 'НЕ ЗАДАН'),
 ];
-foreach (LLM::configSummary() as $k => $v) $diag_header['llm.' . $k] = is_scalar($v) ? (string) $v : json_encode($v);
+foreach (ToolkitLLM::configSummary() as $k => $v) $diag_header['llm.' . $k] = is_scalar($v) ? (string) $v : json_encode($v);
 $diag_full   = DiagLog::asText(DiagLog::tail(400, false), $diag_header, 'site_yacloud_openrouter — полный лог');
 $diag_errors = DiagLog::asText(DiagLog::tail(400, true), $diag_header, 'site_yacloud_openrouter — только ошибки');
 ?>

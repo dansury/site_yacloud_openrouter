@@ -59,7 +59,7 @@ final class LLMHttpError extends RuntimeException {
     }
 }
 
-final class LLM {
+final class ToolkitLLM {
     private static ?array $cfg = null;
     private static $store = null;                      // optional logger
     private static ?string $modelOverride = null;      // short id from AVAILABLE_MODELS
@@ -1420,4 +1420,9 @@ final class LLM {
             self::$store->logLLMCall($sessionId, $step, $model, self::$cfg['PROMPT_VERSION'] ?? 'v1', $latency, $status, $error, $raw);
         } catch (Throwable $e) { /* swallow log errors */ }
     }
+}
+
+// Preserve the standalone API without replacing a host application's LLM class.
+if (!class_exists('LLM', false)) {
+    class_alias(ToolkitLLM::class, 'LLM');
 }

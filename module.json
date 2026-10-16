@@ -1,6 +1,6 @@
 {
   "module": "site_yacloud_openrouter",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "api_version": "1.0.0",
   "repo": "dansury/site_yacloud_openrouter",
   "channel": "main",

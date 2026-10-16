@@ -82,9 +82,9 @@ final class Parser {
     }
 
     private static function tryPdfOCR(string $path, ?string &$error = null): ?string {
-        if (!class_exists('LLM')) { $error = 'LLM class missing'; return null; }
+        if (!class_exists(ToolkitLLM::class)) { $error = 'LLM class missing'; return null; }
         try {
-            return LLM::ocrPdf($path);
+            return ToolkitLLM::ocrPdf($path);
         } catch (Throwable $e) {
             $error = $e->getMessage();
             error_log('[parser.tryPdfOCR] ' . $error);

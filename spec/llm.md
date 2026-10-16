@@ -3,7 +3,7 @@
 > Infrastructural module — no customer TZ behind it; no `[CODE §…]` citations (see `spec.md` §Provenance).
 > Canonical source of this code: repository `site_yacloud_openrouter`.
 
-`final class LLM` — static, one instance per request. Two providers behind one
+`final class ToolkitLLM` — static, one instance per request. The legacy global `LLM` name is a conditional alias, created only when the host has not already declared that class. Internal module calls use `ToolkitLLM`, so a host's instance-based `LLM` can coexist without collisions. Two providers behind one
 interface, per-request model/provider override, config-driven fallback (newer version of
 the same model, then the operator's list, then per-provider fallbacks), vision
 (images) and PDF OCR, provider self-test, optional call logging.
