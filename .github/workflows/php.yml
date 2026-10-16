@@ -20,8 +20,6 @@ jobs:
       - name: PHP syntax
         run: find . -name '*.php' -not -path './data/*' -print0 | xargs -0 -n 1 php -l
       - name: Isolated regression tests
-        env:
-          SELFHEAL_REPORTING: 'off'
         run: |
           for test in tests/*.php; do
             php "$test" || exit 1
