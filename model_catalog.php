@@ -29,6 +29,8 @@
  * PHP 7.4-compatible (no str_contains / str_starts_with).
  */
 
+require_once __DIR__ . '/llm_providers.php';
+
 final class ModelCatalog {
     /** `settings` keys: normalized cache, refresh stamp, last failure reason. */
     const KEY_MODELS = 'MODEL_CATALOG_MODELS';
@@ -60,6 +62,12 @@ final class ModelCatalog {
      * Hardcoded id / group / price are never rewritten — settings point at them.
      */
     public static function merge(array $builtin, array $live): array {
+        foreach ($live as $r) {
+            if (($r['provider'] ?? '') === 'genrouter') {
+                $builtin = array_values(array_filter($builtin, static function ($m) { return ($m['provider'] ?? '') !== 'genrouter'; }));
+                break;
+            }
+        }
         $bySlug = [];
         foreach ($builtin as $i => $r) {
             $bySlug[self::slugKey((string) ($r['provider'] ?? ''), (string) ($r['full_id'] ?? ''))] = $i;
@@ -122,24 +130,34 @@ final class ModelCatalog {
      * ['rows'=>N, 'openrouter'=>N|error text, 'yandex'=>…]. Throws only when NO
      * provider answered — the previous cache is then left untouched.
      */
-    public static function refresh(array $cfg, SettingsStore $store): array {
+    public static function refresh(array $cfg, SettingsStore $store, ?string $provider = null): array {
+        if ($provider !== null) LLMProviders::requireEnabled($cfg, $provider);
+        $previous = self::decode((string) $store->getSetting(self::KEY_MODELS, ''));
         $rows = [];
-        $report = ['openrouter' => null, 'yandex' => null];
-        foreach (['openrouter' => 'fetchOpenRouter', 'yandex' => 'fetchYandex'] as $prov => $fn) {
+        $report = [];
+        $success = false;
+        foreach (['openrouter' => 'fetchOpenRouter', 'yandex' => 'fetchYandex', 'genrouter' => 'fetchGenRouter'] as $prov => $fn) {
+            $retained = array_values(array_filter($previous, static function ($row) use ($prov) { return $row['provider'] === $prov; }));
+            if (!LLMProviders::enabled($cfg, $prov) || ($provider !== null && $prov !== $provider)) {
+                $report[$prov] = null;
+                $rows = array_merge($rows, $retained);
+                continue;
+            }
             try {
-                $got = self::$fn($cfg);
+                $got = array_slice(self::$fn($cfg), 0, self::MAX_MODELS);
                 $report[$prov] = count($got);
                 $rows = array_merge($rows, $got);
+                $success = true;
             } catch (Throwable $e) {
                 $report[$prov] = $e->getMessage();
+                $rows = array_merge($rows, $retained);
             }
         }
-        if (!$rows) {
-            throw new RuntimeException(
-                'OpenRouter: ' . self::asText($report['openrouter']) . '; Yandex: ' . self::asText($report['yandex'])
-            );
+        if (!$success) {
+            $errors = [];
+            foreach ($report as $prov => $value) if (is_string($value)) $errors[] = $prov . ': ' . $value;
+            throw new RuntimeException(implode('; ', $errors) ?: 'Все провайдеры отключены');
         }
-        if (count($rows) > self::MAX_MODELS) $rows = array_slice($rows, 0, self::MAX_MODELS);
         $store->setSetting(self::KEY_MODELS, (string) json_encode($rows, JSON_UNESCAPED_UNICODE));
         $store->setSetting(self::KEY_SYNCED, gmdate('Y-m-d\TH:i:s\Z'));
         // A partial failure (one provider silent) is worth a note too.
@@ -152,7 +170,13 @@ final class ModelCatalog {
     }
 
     /** Drop the live catalogue: only hardcoded models remain in the lists. */
-    public static function forget(SettingsStore $store): void {
+    public static function forget(SettingsStore $store, ?string $provider = null): void {
+        if ($provider !== null) {
+            $rows = self::decode((string) $store->getSetting(self::KEY_MODELS, ''));
+            $rows = array_values(array_filter($rows, static function ($r) use ($provider) { return $r['provider'] !== $provider; }));
+            $store->setSetting(self::KEY_MODELS, (string) json_encode($rows, JSON_UNESCAPED_UNICODE));
+            return;
+        }
         $store->setSetting(self::KEY_MODELS, '');
         $store->setSetting(self::KEY_SYNCED, '');
         $store->setSetting(self::KEY_ERROR, '');
@@ -228,24 +252,38 @@ final class ModelCatalog {
     /* ─────────────────────────── providers ─────────────────────────── */
 
     /** OpenRouter: GET /api/v1/models. The key is optional but sent when present. */
+    private static function fetchGenRouter(array $cfg): array {
+        if (empty($cfg['GENROUTER_API_KEY'])) throw new RuntimeException('GENROUTER_API_KEY не задан');
+        return self::fetchRouter($cfg, 'genrouter');
+    }
+
     private static function fetchOpenRouter(array $cfg): array {
-        $url = (string) preg_replace('~/chat/completions$~', '/models', (string) ($cfg['OPENROUTER_URL'] ?? ''));
+        return self::fetchRouter($cfg, 'openrouter');
+    }
+
+    private static function fetchRouter(array $cfg, string $provider): array {
+        $url = $provider === 'genrouter'
+            ? rtrim((string) ($cfg['GENROUTER_BASE_URL'] ?? 'https://api.genrouter.ru/v1'), '/') . '/models'
+            : (string) preg_replace('~/chat/completions$~', '/models', (string) ($cfg['OPENROUTER_URL'] ?? ''));
         if ($url === '') throw new RuntimeException('OPENROUTER_URL is empty');
         $headers = ['Accept: application/json'];
-        if (!empty($cfg['OPENROUTER_API_KEY'])) $headers[] = 'Authorization: Bearer ' . $cfg['OPENROUTER_API_KEY'];
-        $j = self::httpGetJson($url, $headers, $cfg);
+        $key = (string) ($cfg[strtoupper($provider) . '_API_KEY'] ?? '');
+        if ($key !== '') $headers[] = 'Authorization: Bearer ' . $key;
+        $j = self::httpGetJson($url, $headers, $cfg, $provider);
         $rows = [];
-        foreach ($j['data'] ?? [] as $m) {
+        foreach ($j['data'] ?? $j['models'] ?? $j as $m) {
+            $m = is_string($m) ? ['id' => $m] : $m;
+            if (!is_array($m)) continue;
             $slug = isset($m['id']) && is_string($m['id']) ? trim($m['id']) : '';
-            if ($slug === '' || strpos($slug, '/') === false) continue;
+            if (!preg_match('~^\w[\w.\-:]*(?:/\w[\w.\-:]*)*$~', $slug)) continue;
             $pin  = self::usdPerMillion($m['pricing']['prompt'] ?? null);
             $pout = self::usdPerMillion($m['pricing']['completion'] ?? null);
             $row = [
-                'id'            => 'or-' . self::shortId($slug),
+                'id'            => $provider === 'genrouter' ? 'genrouter:' . $slug : 'or-' . self::shortId($slug),
                 'label'         => self::niceLabel($m['name'] ?? '', $slug),
-                'provider'      => 'openrouter',
+                'provider'      => $provider,
                 'full_id'       => $slug,
-                'group'         => 'OpenRouter · ' . self::vendorTitle($slug) . ' (каталог)',
+                'group'         => LLMProviders::LABELS[$provider] . ' · ' . self::vendorTitle($slug) . ' (каталог)',
                 // Pricing arrives in USD per token; the RUB estimates of the
                 // hardcoded rows are not invented here.
                 'price_in'      => 0.0,
@@ -256,7 +294,9 @@ final class ModelCatalog {
                 'vision'        => self::openRouterSeesImages($m),
                 'live'          => true,
             ];
-            if ($pin === 0.0 && $pout === 0.0) $row['free'] = true;
+            if ((isset($m['pricing']['prompt'], $m['pricing']['completion'])
+                && is_numeric($m['pricing']['prompt']) && is_numeric($m['pricing']['completion'])
+                && $pin === 0.0 && $pout === 0.0) || substr($slug, -5) === ':free') $row['free'] = true;
             $rows[] = $row;
         }
         if (!$rows) throw new RuntimeException('no models in the response');
@@ -434,7 +474,7 @@ final class ModelCatalog {
 
     /* ──────────────────────────── helpers ──────────────────────────── */
 
-    private static function httpGetJson(string $url, array $headers, array $cfg): array {
+    private static function httpGetJson(string $url, array $headers, array $cfg, string $provider = 'yandex'): array {
         if (!filter_var($url, FILTER_VALIDATE_URL)) throw new RuntimeException('bad url: ' . $url);
         $ch = curl_init($url);
         curl_setopt_array($ch, [
@@ -446,6 +486,7 @@ final class ModelCatalog {
             CURLOPT_CONNECTTIMEOUT => 10,
             CURLOPT_USERAGENT      => 'site_yacloud_openrouter (+model catalog)',
         ]);
+        curl_setopt_array($ch, LLMProviders::proxyOptions($cfg, $provider));
         $body = curl_exec($ch);
         $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
         $err  = curl_error($ch);

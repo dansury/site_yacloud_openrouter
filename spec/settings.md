@@ -34,7 +34,7 @@ and never breaks config loading.
 `YANDEX_OCR_MODEL`, `YANDEX_OCR_ENABLED`, `ADMIN_EMAIL`, `ERROR_EMAIL`, `SMTP_HOST`,
 `SMTP_PORT`, `SMTP_USER`, `SMTP_PASS`, `SMTP_FROM`, `SMTP_FROM_NAME`, `ADMIN_PASSWORD`.
 
-Keys outside the whitelist are ENV/code-only (e.g. `OPENROUTER_URL`, `LLM_TIMEOUT_SEC`,
+Keys outside the whitelist are ENV/code-only (e.g. `LLM_TIMEOUT_SEC`,
 `LLM_MAX_RETRIES`, `DB_PATH`, `LOG_DIR`, `PROMPT_VERSION`, `AVAILABLE_MODELS`).
 
 ### Key groups & defaults
@@ -193,3 +193,9 @@ No model field is free text: every one of them is a `<select>` over the catalogu
 
 Deployment note: the page must not be reachable without TLS, and `ADMIN_PASSWORD` must
 be set before the file is exposed to the web.
+
+## Provider connection cards
+
+Three provider cards expose immediate on/off switches, masked API keys, per-provider model dropdowns, connection tests and independent catalog refresh/forget buttons. GenRouter additionally exposes its API base address. Key fields are linked to the providers' cabinets. Empty secrets retain saved values; disabling preserves keys, models, order and cached models. Switching on appends an absent provider to `LLM_PROVIDER_PRIORITY`. Switching off hides its operational controls and excludes its options from all model pickers. The toggle saves via an authenticated POST with a session CSRF nonce, updates controls without reloading or losing unrelated edits, and restores the checkbox with a visible error on failure. All settings POSTs require the same nonce, except the login and separately protected selfheal actions.
+
+Additional whitelisted ENV/settings keys: `GENROUTER_API_KEY`, `GENROUTER_MODEL`, `GENROUTER_BASE_URL`, `LLM_ENABLED_OPENROUTER`, `LLM_ENABLED_YANDEX`, `LLM_ENABLED_GENROUTER`, `OPENROUTER_URL`, `LLM_PROXY`, `LLM_PROXY_AUTH`, `LLM_PROXY_OPENROUTER`, `LLM_PROXY_YANDEX`, `LLM_PROXY_GENROUTER`. Proxy credentials and GenRouter keys are registered with diagnostic and selfheal redactors, including newly saved secrets. The provider priority control supports all three providers. Mail auto-reply controls from kp-atlant belong to its mail workflow and are not part of this infrastructure module.

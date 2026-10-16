@@ -52,7 +52,7 @@ segment belongs to the address, not to `full_id`: a slug that already carries on
 LLM::chatText(string $system, string $user, ?int $sessionId = null, float $temp = 0.7): string
 LLM::chatJson(string $system, string $user, ?int $sessionId = null, float $temp = 0.1): array
 LLM::visionJson(string $system, string $userText, array $imageDataUrls, ?int $sessionId = null, float $temp = 0.1): array
-LLM::probe(): array                                 // provider self-test, never throws
+LLM::probe(?string $onlyProvider = null): array                                 // provider self-test, never throws
 LLM::lastTrace(): array                             // per-candidate outcome of the last dispatch
 LLM::traceText(): string
 LLM::failureReason(?array $trace = null): string    // one sentence per provider, for the end user (§4.3)
@@ -319,3 +319,11 @@ php example.php ocr   <file.pdf>    # LLM::ocrPdf
 php example.php parse <file.docx>   # Parser::extract + normalize
 php example.php email <address>     # Mailer::sendCustom
 ```
+
+## Provider controls and GenRouter
+
+Connection behavior follows kp-atlant module 070, adapted without its database or application dependencies. GenRouter is a third provider, using `GENROUTER_BASE_URL` (default `https://api.genrouter.ru/v1`), Bearer `GENROUTER_API_KEY`, and `/chat/completions`. Its fallback/model is `GENROUTER_MODEL` (initial `anthropic/claude-opus-5`). Qualified `genrouter:<exact-id>` references work for text, JSON, image vision and parallel calls. OpenRouter PDF plugins remain OpenRouter-only.
+
+`LLM_ENABLED_OPENROUTER` and `LLM_ENABLED_YANDEX` default to 1; `LLM_ENABLED_GENROUTER` defaults to 0. Disabled providers are removed from every candidate pool, automatic model choice, probes and OCR. Explicit overrides targeting them fail clearly. No enabled providers means no outgoing inference calls. A provider override selects that provider's own model, never relabels another provider's slug.
+
+`LLM_PROXY` and masked `LLM_PROXY_AUTH` define an optional shared proxy; `LLM_PROXY_OPENROUTER` defaults on, Yandex/GenRouter off. A proxy is applied only when both its address and the provider toggle are set, consistently for generation, parallel calls, catalogs and Yandex OCR. Proxy credentials are never printed. HTTP 402 is reported as insufficient balance, and disables further attempts on that provider for the current chain. Existing public calls and the host LLM coexistence alias remain compatible. The optional `probe($onlyProvider)` argument restricts the test to the current model of that enabled provider; no other provider or fallback leg is contacted.

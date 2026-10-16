@@ -71,8 +71,7 @@ ModelCatalog::newerSiblings(array $row, array $models): array
 
 Transport: cURL, `Accept: application/json`, follow ≤ 3 redirects, timeout
 `clamp(LLM_TIMEOUT_SEC, 10, 30)` s, connect timeout 10 s. Non-JSON body, HTTP ≥ 400 or a
-transport error → `RuntimeException` for that provider only. The stored list is capped at
-`MAX_MODELS` (500).
+transport error → `RuntimeException` for that provider only. Each provider partition is capped at `MAX_MODELS` (500).
 
 ### Row normalization
 
@@ -129,3 +128,9 @@ yields no match rather than a wrong one.
 - `setup.php` — `maybeRefresh()` on load, forced `refresh()` / `forget()` from the two
   buttons, and the cache status line (count, stamp, last error).
 - `llm.php` — `newerSiblings()` behind `LLM::autoFallbackRows()` (`spec/llm.md` §4).
+
+## Three-provider catalog controls
+
+GenRouter reads authenticated `GET <GENROUTER_BASE_URL>/models`, accepting `data`, `models` or a bare array, object or string IDs including slugs without vendor prefixes. IDs are validated; exact `full_id` values are preserved. Its UI IDs are provider-qualified exact slugs (`genrouter:<id>`), so punctuation cannot create collisions. Unknown pricing is not free; only explicit numeric zero prices or a `:free` suffix indicate free models. A successful GenRouter catalog is authoritative, replacing its starter entries in the picker.
+
+Refresh skips disabled providers without HTTP. `refresh($cfg, $store, ?$provider = null)` can refresh one enabled provider; a disabled explicit refresh fails. The cache partitions rows by provider: failed or disabled legs retain their last good rows, successful legs replace only their own rows. Limits apply per provider (500 each), so a large OpenRouter catalog cannot crowd GenRouter out. `forget($store, ?$provider = null)` clears only the chosen partition when specified. The automatic TTL refresh retains the same failure-preservation rule. Catalog traffic uses the same provider proxy settings as inference.

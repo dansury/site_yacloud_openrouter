@@ -1,11 +1,11 @@
 <?php
 /**
- * LLM provider wrapper — OpenRouter + Yandex Foundation Models.
+ * LLM provider wrapper — OpenRouter + Yandex Foundation Models + GenRouter.
  * spec: spec/llm.md — infrastructural code, no customer TZ behind it.
  * (Extracted from resume-index/llm.php; report-specific logic removed.)
  *
  * Features:
- *  - Two providers behind one interface: OpenRouter (Bearer) and Yandex
+ *  - Three providers behind one interface: OpenRouter/GenRouter (Bearer) and Yandex
  *    (Api-Key + folder, gpt:// model URIs, OpenAI-compatible endpoint).
  *  - Per-session model / provider overrides (LLM::setModelOverride / setProviderOverride).
  *  - Config-driven fallback chain: the chosen model first, then — with
@@ -22,6 +22,7 @@
  *   $store — optional object with logLLMCall(...) (no-op if absent)
  */
 
+require_once __DIR__ . '/llm_providers.php';
 require_once __DIR__ . '/model_catalog.php';   // model versions for the auto fallback
 
 /**
@@ -51,6 +52,7 @@ final class LLMHttpError extends RuntimeException {
      * the model either.
      */
     public function providerWide(): ?string {
+        if ($this->status === 402) return 'недостаточно средств у провайдера';
         if ($this->status === 401 || $this->status === 407) return 'ключ провайдера отклонён';
         if ($this->status !== 403) return null;
         $j = json_decode($this->body, true);
@@ -127,6 +129,7 @@ final class ToolkitLLM {
             || strpos($r, 'openai api instead') !== false)     return 'модель отвечает только по OpenAI-совместимому адресу';
         if (strpos($r, 'access denied by security policy') !== false) return 'запрос блокирует хостинг';
         if (strpos($r, 'http 401') !== false)                  return 'ключ не принят';
+        if (strpos($r, 'http 402') !== false)                  return 'недостаточно средств';
         if (strpos($r, 'http 403') !== false)                  return 'доступ к модели запрещён';
         if (strpos($r, 'http 429') !== false)                  return 'превышен лимит запросов';
         if (strpos($r, 'text is empty') !== false
@@ -146,13 +149,18 @@ final class ToolkitLLM {
     /** Per-session model override. Resolved against AVAILABLE_MODELS at call time. */
     public static function setModelOverride(?string $shortId): void {
         $shortId = $shortId !== null ? trim($shortId) : '';
+        if ($shortId !== '') {
+            $row = self::findModel($shortId) ?? self::resolveModelSpec($shortId);
+            if ($row !== null) LLMProviders::requireEnabled(self::cfg(), (string) $row['provider']);
+        }
         self::$modelOverride = $shortId !== '' ? $shortId : null;
     }
 
-    /** Per-session provider override ('openrouter' | 'yandex'). NULL → use cfg.LLM_PROVIDER. */
+    /** Per-session provider override ('openrouter' | 'yandex' | 'genrouter'). NULL → use cfg.LLM_PROVIDER. */
     public static function setProviderOverride(?string $provider): void {
         $provider = $provider !== null ? strtolower(trim($provider)) : '';
-        self::$providerOverride = in_array($provider, ['openrouter', 'yandex'], true) ? $provider : null;
+        if ($provider !== '' && isset(LLMProviders::LABELS[$provider])) LLMProviders::requireEnabled(self::cfg(), $provider);
+        self::$providerOverride = in_array($provider, ['openrouter', 'yandex', 'genrouter'], true) ? $provider : null;
     }
 
     public static function effectiveProvider(): string {
@@ -161,9 +169,9 @@ final class ToolkitLLM {
     }
 
     /** Ordered provider fallback list from LLM_PROVIDER_PRIORITY. Validates against
-     *  known providers, dedupes, and guarantees both appear so a leg is never dropped. */
+     *  known providers, dedupes, and appends enabled providers for compatibility. */
     private static function providerPriority(): array {
-        $known = ['openrouter', 'yandex'];
+        $known = ['openrouter', 'yandex', 'genrouter'];
         $raw = (string) (self::cfg()['LLM_PROVIDER_PRIORITY'] ?? 'openrouter,yandex');
         $list = [];
         foreach (explode(',', $raw) as $p) {
@@ -174,7 +182,7 @@ final class ToolkitLLM {
         foreach ($known as $p) {
             if (!in_array($p, $list, true)) $list[] = $p;
         }
-        return $list;
+        return array_values(array_filter($list, static function ($p) { return LLMProviders::enabled(self::cfg(), $p); }));
     }
 
     /** Fallback mode: 'auto' — newer version of the same model first, 'manual' — list only. */
@@ -226,7 +234,7 @@ final class ToolkitLLM {
         $spec = trim($spec);
         if ($spec === '') return null;
         $provider = null;
-        if (preg_match('~^(openrouter|yandex):(.+)$~i', $spec, $m)) {
+        if (preg_match('~^(openrouter|yandex|genrouter):(.+)$~i', $spec, $m)) {
             $provider = strtolower($m[1]);
             $spec = trim($m[2]);
         }
@@ -308,28 +316,27 @@ final class ToolkitLLM {
 
     /** Resolve the active model for the current request, honoring provider override. */
     private static function activeModel(): array {
-        $shortId = self::$modelOverride ?: (self::cfg()['LLM_DEFAULT_MODEL'] ?? 'yandexgpt-5-lite');
+        $cfg = self::cfg();
+        $shortId = self::$modelOverride ?: ($cfg['LLM_DEFAULT_MODEL'] ?? 'yandexgpt-5-lite');
+        $row = self::findModel($shortId) ?? self::resolveModelSpec($shortId);
         $effective = self::effectiveProvider();
-        $row = self::findModel($shortId);
-        // OCR-only models (Yandex Vision OCR) are not chat models.
-        if ($row !== null && !empty($row['ocr_only'])) $row = null;
-        if ($row !== null && self::$providerOverride !== null && ($row['provider'] ?? '') !== $effective) {
-            foreach ((self::cfg()['AVAILABLE_MODELS'] ?? []) as $r) {
-                if (($r['id'] ?? '') === $shortId && ($r['provider'] ?? '') === $effective) { $row = $r; break; }
+        if (self::$modelOverride !== null && $row !== null) LLMProviders::requireEnabled($cfg, (string) $row['provider']);
+        if (self::$providerOverride !== null) LLMProviders::requireEnabled($cfg, $effective);
+        if ($row !== null && empty($row['ocr_only']) && LLMProviders::enabled($cfg, (string) $row['provider'])
+            && (self::$providerOverride === null || $row['provider'] === $effective)) return $row;
+        $keys = ['openrouter' => 'LLM_FALLBACK_MODEL', 'yandex' => 'YANDEX_FALLBACK_MODEL', 'genrouter' => 'GENROUTER_MODEL'];
+        $providers = array_values(array_unique(array_merge([$effective], self::providerPriority())));
+        foreach ($providers as $provider) {
+            if (!LLMProviders::ready($cfg, $provider)) continue;
+            if (self::$providerOverride !== null && $provider !== $effective) continue;
+            $slug = (string) ($cfg[$keys[$provider]] ?? '');
+            if ($slug !== '') return self::resolveModelSpec($provider . ':' . $slug);
+            foreach ($cfg['AVAILABLE_MODELS'] ?? [] as $candidate) {
+                if ($candidate['provider'] === $provider && empty($candidate['ocr_only'])) return $candidate;
             }
         }
-        if ($row !== null) return $row;
-        $default = self::findModel(self::cfg()['LLM_DEFAULT_MODEL'] ?? 'yandexgpt-5-lite');
-        if ($default !== null) {
-            if (self::$providerOverride !== null && ($default['provider'] ?? '') !== $effective) {
-                $default['provider'] = $effective;
-            }
-            return $default;
-        }
-        return [
-            'id' => $shortId, 'label' => $shortId, 'provider' => $effective,
-            'full_id' => $shortId, 'price_in' => 0.0, 'price_out' => 0.0,
-        ];
+        // A placeholder preserves the chain's shape when no provider is ready.
+        return ['id' => $shortId, 'label' => $shortId, 'provider' => $effective, 'full_id' => $shortId];
     }
 
     /* ──────────── Public chat entry points ──────────── */
@@ -409,7 +416,7 @@ final class ToolkitLLM {
             ['label' => 'mistral-ocr', 'extra' => ['plugins' => [['id' => 'file-parser', 'pdf' => ['engine' => 'mistral-ocr']]]]],
             ['label' => 'native',      'extra' => []],
         ];
-        if (!empty($cfg['OPENROUTER_API_KEY'])) {
+        if (LLMProviders::ready($cfg, 'openrouter')) {
             foreach ($ocrRows as $row) {
                 $model = (string) $row['full_id'];
                 foreach ($strategies as $s) {
@@ -449,6 +456,7 @@ final class ToolkitLLM {
      *  (appending a reason to &$errors), never throws. */
     private static function tryYandexVisionOcr(string $pdfBytes, array &$errors): ?string {
         $cfg = self::cfg();
+        if (!LLMProviders::enabled($cfg, 'yandex')) { $errors[] = 'yandex-ocr: disabled'; return null; }
         if (($cfg['YANDEX_OCR_ENABLED'] ?? '1') !== '1') { $errors[] = 'yandex-ocr: disabled'; return null; }
         $folder = (string) ($cfg['YANDEX_FOLDER_ID'] ?? '');
         $apiKey = (string) ($cfg['YANDEX_API_KEY'] ?? '');
@@ -474,6 +482,7 @@ final class ToolkitLLM {
             CURLOPT_TIMEOUT => (int) ($cfg['LLM_TIMEOUT_SEC'] ?? 120),
             CURLOPT_CONNECTTIMEOUT => 15,
         ]);
+        curl_setopt_array($ch, LLMProviders::proxyOptions($cfg, 'yandex'));
         $out = curl_exec($ch);
         $code = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
         $err = curl_error($ch);
@@ -530,9 +539,7 @@ final class ToolkitLLM {
         $primary = self::activeModel();
         $provider = $primary['provider'] ?? self::effectiveProvider();
 
-        $hasOR = !empty($cfg['OPENROUTER_API_KEY']);
-        $hasYA = !empty($cfg['YANDEX_API_KEY']) && !empty($cfg['YANDEX_FOLDER_ID']);
-        $providerReady = ($provider === 'openrouter' && $hasOR) || ($provider === 'yandex' && $hasYA);
+        $providerReady = LLMProviders::ready($cfg, $provider);
         if (!$providerReady) {
             return [
                 self::callJson($specA['step'], $specA['system'], $specA['user'], $sessionId, (float) $specA['temp']),
@@ -735,6 +742,8 @@ final class ToolkitLLM {
         $cfg = self::cfg();
         $provider = $modelRow['provider'] ?? 'openrouter';
 
+        LLMProviders::requireEnabled($cfg, $provider);
+
         if ($provider === 'yandex') {
             $folder = $cfg['YANDEX_FOLDER_ID'] ?? '';
             if ($folder === '' || empty($cfg['YANDEX_API_KEY'])) {
@@ -753,6 +762,11 @@ final class ToolkitLLM {
                         'body' => $body, 'model' => $modelStr, 'route' => 'fm'];
             }
             $url = (string) $cfg['YANDEX_LLM_URL'];
+        } elseif ($provider === 'genrouter') {
+            if (empty($cfg['GENROUTER_API_KEY'])) throw new RuntimeException('GenRouter not configured (GENROUTER_API_KEY empty)');
+            $url = rtrim((string) ($cfg['GENROUTER_BASE_URL'] ?? 'https://api.genrouter.ru/v1'), '/') . '/chat/completions';
+            $modelStr = (string) $modelRow['full_id'];
+            $headers = ['Authorization: Bearer ' . $cfg['GENROUTER_API_KEY'], 'Content-Type: application/json'];
         } else {
             $url = (string) $cfg['OPENROUTER_URL'];
             if (empty($cfg['OPENROUTER_API_KEY'])) {
@@ -789,6 +803,7 @@ final class ToolkitLLM {
             CURLOPT_TIMEOUT => $cfg['LLM_TIMEOUT_SEC'],
             CURLOPT_CONNECTTIMEOUT => 15,
         ]);
+        curl_setopt_array($ch, LLMProviders::proxyOptions($cfg, (string) ($modelRow['provider'] ?? 'openrouter')));
         return $ch;
     }
 
@@ -933,6 +948,7 @@ final class ToolkitLLM {
         if ($vision) $named = array_merge($named, self::visionModelRows());
         foreach ($named as $row) {
             $prov = $row['provider'] ?? 'openrouter';
+            if (!LLMProviders::ready($cfg, $prov)) continue;
             if ($prov === 'openrouter' && !$hasOR) continue;
             if ($prov === 'yandex' && !$hasYA) continue;
             // A slug never travels to the other provider: the row keeps its own.
@@ -945,8 +961,10 @@ final class ToolkitLLM {
         $fallbackModels = [
             'openrouter' => (string) ($cfg['LLM_FALLBACK_MODEL'] ?? 'openrouter/auto'),
             'yandex'     => (string) ($cfg['YANDEX_FALLBACK_MODEL'] ?? 'yandexgpt-5-lite'),
+            'genrouter'  => (string) ($cfg['GENROUTER_MODEL'] ?? ''),
         ];
         foreach (self::providerPriority() as $prov) {
+            if (!LLMProviders::ready($cfg, $prov)) continue;
             if ($prov === 'openrouter' && !$hasOR) continue;
             if ($prov === 'yandex' && !$hasYA) continue;
             $fbModel = $fallbackModels[$prov] ?? '';
@@ -967,6 +985,7 @@ final class ToolkitLLM {
         // One attempt per provider+slug pair, in the order built above.
         $seen = [];
         $candidates = array_values(array_filter($candidates, static function (array $row) use (&$seen) {
+            if (!LLMProviders::enabled(self::cfg(), (string) ($row['provider'] ?? ''))) return false;
             $key = ($row['provider'] ?? '?') . '|' . ($row['full_id'] ?? '?');
             if (isset($seen[$key])) return false;
             $seen[$key] = true;
@@ -1073,6 +1092,8 @@ final class ToolkitLLM {
             'vision_resolved' => $vision !== null ? ($vision['provider'] . ':' . $vision['full_id']) : '(не разобрана)',
             'fallback_mode'   => self::fallbackMode(),
             'fallback_models' => (string) ($cfg['LLM_FALLBACK_MODELS'] ?? ''),
+            'genrouter_key' => !empty($cfg['GENROUTER_API_KEY']) ? 'задан' : 'НЕ ЗАДАН',
+            'enabled_providers' => self::providerPriority(),
             'openrouter_key'  => !empty($cfg['OPENROUTER_API_KEY']) ? 'задан' : 'НЕ ЗАДАН',
             'yandex_key'      => !empty($cfg['YANDEX_API_KEY']) ? 'задан' : 'НЕ ЗАДАН',
             'yandex_folder'   => !empty($cfg['YANDEX_FOLDER_ID']) ? (string) $cfg['YANDEX_FOLDER_ID'] : 'НЕ ЗАДАН',
@@ -1089,8 +1110,9 @@ final class ToolkitLLM {
      * operator sees «key wrong» / «model not in this folder» instead of a
      * recognition failure hours later.
      */
-    public static function probe(): array {
+    public static function probe(?string $onlyProvider = null): array {
         $cfg = self::cfg();
+        if ($onlyProvider !== null) LLMProviders::requireEnabled($cfg, $onlyProvider);
         $out = [];
         $messages = [
             ['role' => 'system', 'content' => 'Отвечай одним словом.'],
@@ -1101,14 +1123,20 @@ final class ToolkitLLM {
         $legs['модель по умолчанию'] = $default;
         $vision = self::visionModelRow();
         if ($vision !== null) $legs['vision-модель'] = $vision;
-        foreach (['openrouter' => 'LLM_FALLBACK_MODEL', 'yandex' => 'YANDEX_FALLBACK_MODEL'] as $prov => $key) {
+        foreach (['openrouter' => 'LLM_FALLBACK_MODEL', 'yandex' => 'YANDEX_FALLBACK_MODEL', 'genrouter' => 'GENROUTER_MODEL'] as $prov => $key) {
             $slug = (string) ($cfg[$key] ?? '');
             if ($slug === '') continue;
             $legs['запасная ' . $prov] = ['provider' => $prov, 'full_id' => $slug, 'id' => 'fallback_' . $prov];
         }
         foreach ($legs as $label => $row) {
             $prov = (string) ($row['provider'] ?? 'openrouter');
+            if ($onlyProvider !== null && ($prov !== $onlyProvider || $label !== 'модель по умолчанию')) continue;
+            if (!LLMProviders::enabled($cfg, $prov)) continue;
             $tag = $prov . ':' . ($row['full_id'] ?? '?');
+            if ($prov === 'genrouter' && empty($cfg['GENROUTER_API_KEY'])) {
+                $out[] = ['leg' => $label, 'model' => $tag, 'ok' => false, 'text' => 'GENROUTER_API_KEY не задан'];
+                continue;
+            }
             if ($prov === 'openrouter' && empty($cfg['OPENROUTER_API_KEY'])) {
                 $out[] = ['leg' => $label, 'model' => $tag, 'ok' => false, 'text' => 'OPENROUTER_API_KEY не задан'];
                 continue;
@@ -1206,6 +1234,7 @@ final class ToolkitLLM {
             CURLOPT_TIMEOUT => $cfg['LLM_TIMEOUT_SEC'],
             CURLOPT_CONNECTTIMEOUT => 15,
         ]);
+        curl_setopt_array($ch, LLMProviders::proxyOptions($cfg, (string) $provider));
         $out = curl_exec($ch);
         $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
         $err = curl_error($ch);

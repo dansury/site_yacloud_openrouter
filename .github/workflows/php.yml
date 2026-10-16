@@ -1,0 +1,26 @@
+name: PHP regression
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  php:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        php: ['7.4', '8.3']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: curl, pdo_sqlite, zip, dom, mbstring, openssl
+          coverage: none
+      - name: PHP syntax
+        run: find . -name '*.php' -not -path './data/*' -print0 | xargs -0 -n 1 php -l
+      - name: Isolated regression tests
+        run: |
+          for test in tests/*.php; do
+            php "$test" || exit 1
+          done
